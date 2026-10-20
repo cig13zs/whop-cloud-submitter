@@ -21,7 +21,7 @@ globalThis.fetch = async (url, opt = {}) => {
   if (url.includes('/feeds/videos.xml')) return new Response(feedXml);
   if (url.includes('tiktok.com/oembed')) return new Response('{}', { status: publicVids.has('tt:' + decodeURIComponent(url).split('/video/')[1]) ? 200 : 400 });
   if (url.includes('/oembed')) return new Response('{}', { status: publicVids.has(url.split('/shorts/')[1]) ? 200 : 401 });
-  if (url.includes('contentrewards.com/api/campaign')) {
+  if (url.includes('/api/campaign/campaigns/')) {
     const id = url.split('/').pop();
     if (campaignStatus[id]?.broken) return json({ success: false });
     return json({ data: { status: campaignStatus[id]?.status || 'active', configuration: campaignStatus[id]?.cap ? { maxSubmissionsPerUser: campaignStatus[id].cap } : {} } });

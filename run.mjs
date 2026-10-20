@@ -95,7 +95,8 @@ export async function publish(vid, channel) {
 
 // ---- Content Rewards ----------------------------------------------------------------------------------------------
 export async function cap(campaign) { // public API; paused or exhausted campaigns can't take a submit
-  const r = await fetch(`https://contentrewards.com/api/campaign/campaigns/${campaign}`, { headers: { 'user-agent': UA } });
+  // The app origin serves the same public campaign API; contentrewards.com itself was down on 2026-10-20 while the app was up.
+  const r = await fetch(`${ORIGIN}/api/campaign/campaigns/${campaign}`, { headers: { 'user-agent': UA } });
   const { data } = await r.json().catch(() => ({}));
   if (!data) throw new Error(`campaign ${campaign}: HTTP ${r.status}, no data`);
   if (data.status !== 'active') return 0;
