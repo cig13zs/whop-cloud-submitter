@@ -1,0 +1,19 @@
+name: tick
+# Second timer for submit.yml (2026-10-21). submit.yml's own schedule has never fired since this repo was
+# created on 10-20, and the external cron-job.org trigger lost access when the repo was replaced.
+# GITHUB_TOKEN may start workflow_dispatch runs, so this needs no personal token.
+on:
+  schedule:
+    - cron: '8,23,38,53 * * * *'
+  workflow_dispatch:
+permissions:
+  actions: write
+jobs:
+  kick:
+    if: vars.CLOUD_ON == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: gh workflow run submit.yml --repo "$GITHUB_REPOSITORY" --ref main
+        env:
+          GH_TOKEN: ${{ github.token }}
