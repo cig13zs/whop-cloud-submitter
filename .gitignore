@@ -1,0 +1,8 @@
+node_modules/
+*.log
+.env
+# plaintext data: only the .enc copies are committed (public repo, crypt.mjs)
+queue.json
+state.json
+laptop-state.json
+_archive/

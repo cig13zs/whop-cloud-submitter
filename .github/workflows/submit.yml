@@ -1,0 +1,60 @@
+name: whop-submit
+on:
+  schedule:
+    # Every 10 min, all day, off the :00 mark where GitHub queues back up. The repo is public since 2026-10-20, so Actions
+    # minutes are free and unlimited (the private repo's 2,000 a month ran out on the 20th).
+    - cron: '3,13,23,33,43,53 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Check the secrets and print the plan; publish and submit nothing'
+        type: boolean
+        default: false
+      probe:
+        description: 'Dry run only: comma-separated TikTok/Instagram post URLs to check from the runner'
+        type: string
+        default: ''
+      ig_probe:
+        description: 'Dry run only: ig-media asset name to upload as a never-published Reel container'
+        type: string
+        default: ''
+# No pull_request trigger on purpose: forks can never run this with the secrets. workflow_dispatch needs write access.
+concurrency:
+  group: whop-submit
+  cancel-in-progress: false
+permissions:
+  contents: write
+jobs:
+  pass:
+    # The cron only runs once the repo variable CLOUD_ON is "true" (go-live switch; a skipped job bills nothing).
+    if: github.event_name == 'workflow_dispatch' || vars.CLOUD_ON == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned: this runner holds the secrets
+      - name: Decrypt the queue and state
+        run: node crypt.mjs open
+        env:
+          DATA_KEY: ${{ secrets.DATA_KEY }}
+      - name: Publish due clips and submit them
+        run: node run.mjs ${{ inputs.dry_run && '--dry-run' || '' }}
+        env:
+          WHOP_CR_COOKIE: ${{ secrets.WHOP_CR_COOKIE }}
+          YT_CLIENT: ${{ secrets.YT_CLIENT }}
+          YT_REFRESH_TOKENS: ${{ secrets.YT_REFRESH_TOKENS }}
+          IG_TOKEN: ${{ secrets.IG_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          PROBE: ${{ inputs.dry_run && inputs.probe || '' }}
+          IG_PROBE: ${{ inputs.dry_run && inputs.ig_probe || '' }}
+      - name: Commit state.json.enc
+        if: always() && !inputs.dry_run
+        env:
+          DATA_KEY: ${{ secrets.DATA_KEY }}
+        run: |
+          node crypt.mjs seal state.json
+          git diff --quiet state.json.enc && exit 0
+          git config user.name whop-cloud
+          git config user.email whop-cloud@users.noreply.github.com
+          git commit -q -m "state $(date -u +%FT%TZ)" state.json.enc
+          for i in 1 2 3; do git pull -q --rebase && git push -q && exit 0; sleep 5; done
+          exit 1
