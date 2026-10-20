@@ -107,7 +107,10 @@ export async function cap(campaign) { // public API; paused or exhausted campaig
 const actionIds = {};
 export async function actionId(name) {
   if (actionIds[name]) return actionIds[name];
-  const html = await (await fetch(PAGE(DEFAULTS.UC1xCBrygVPEwmmzLxSN_zNg), { headers: { 'user-agent': UA } })).text();
+  const page = await fetch(PAGE(DEFAULTS.UC1xCBrygVPEwmmzLxSN_zNg), { headers: { 'user-agent': UA } });
+  // A whole-site outage (Cloudflare 530 "Origin DNS error", 2026-10-20) read as "changed its app"; say what it is.
+  if (!page.ok) throw Object.assign(new Error(`Content Rewards is down (HTTP ${page.status}); holding everything`), { fatal: true });
+  const html = await page.text();
   const queue = [...html.matchAll(/\/c\/_next\/static\/chunks\/[\w.\-/]+?\.js/g)].map(m => m[0]), seen = new Set();
   while (queue.length && seen.size < 400) { // ponytail: plain BFS over ~80 chunks (~10 s); cache ids if it gets slow
     const p = queue.shift();
