@@ -3,7 +3,7 @@ on:
   schedule:
     # Every 10 min, all day, off the :00 mark where GitHub queues back up. The repo is public since 2026-10-20, so Actions
     # minutes are free and unlimited (the private repo's 2,000 a month ran out on the 20th).
-    - cron: '3,13,23,33,43,53 * * * *'
+    - cron: '3,13,23,33,43,53 * * * *'  # re-registered 2026-10-20 (no schedule events since the repo was created)
   workflow_dispatch:
     inputs:
       dry_run:
