@@ -5,6 +5,29 @@ GitHub Actions, so it keeps working after the laptop is shut down for school. It
 `tools/whop_watch.py`: per-channel 5-minute GAP, the 30-minute window, campaign caps, and the Charisma Tape feed
 backstop.
 
+## Public repo, encrypted data (since 2026-10-20)
+
+The private repo's 2,000 Actions minutes a month ran out on 10-20 (the laptop had dispatched ~100 runs a day). The repo
+is now public, so minutes are free and unlimited. The old private repo, with its full history, is
+`cig13zs/whop-cloud-submitter-archive` (workflow disabled), and there is also a bundle in `../_archive/`.
+- `queue.json`, `state.json` and `laptop-state.json` exist only locally (gitignored). Git carries `*.json.enc`,
+  encrypted with AES-256-GCM by `crypt.mjs`. The key is the `DATA_KEY` secret, with a laptop copy at
+  `~/.claude/keys/whop-runner-data.key`.
+- `whop_watch.py` decrypts after every pull and seals before every commit. The workflow decrypts first, then seals
+  `state.json` back into `state.json.enc`.
+- Logs are public, so `run.mjs` masks every clip, campaign, channel and post id (`::add-mask::`) before printing.
+- Hardening:
+  - no `pull_request` trigger, so forks never see the secrets;
+  - only GitHub-owned actions, with checkout pinned by SHA;
+  - read-only default token;
+  - secret scanning with push protection;
+  - the `protect-main` ruleset (no deletion, no force-push).
+- Laptop on: `whop_watch.py` runs `run.mjs` locally (`refresh-session.mjs --local`, saves to `laptop-state.json`) instead
+  of dispatching a GitHub run. The cron covers the laptop-off hours, every 10 min, all day.
+- A clip Lorence makes public by hand before its slot is submitted on the next run.
+- `IG_TOKEN` is not set on the new repo. Lorence adds it if Instagram API posting comes back (it must belong to
+  `bloxluckclips`).
+
 ## How it works
 
 | Piece | Where | Who writes it |
