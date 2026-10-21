@@ -179,9 +179,11 @@ export async function submit(vid, campaign, url = `https://www.youtube.com/watch
   return { stage: r.status === 401 || /AUTHORIZED/.test(code) ? 'unauthorized' : 'refused', error: `${code}: ${message}` };
 }
 
+// Content Rewards dropped listMySubmissionsAction (~10-21), which held every clip as "session dead". The session check
+// now goes through the same REST API submit() uses, so it can only fail when submitting would fail too.
 export async function whopCheck() { // read-only: does WHOP_CR_COOKIE still open the app?
-  const res = await action('listMySubmissionsAction', DEFAULTS.UC1xCBrygVPEwmmzLxSN_zNg, [{}]);
-  return res.blocked ? `blocked (${res.blocked})` : res.success ? 'ok' : `${res.code}`;
+  const r = await restCheck();
+  return r.startsWith('ok') ? 'ok' : r;
 }
 export async function restCheck(campaign = DEFAULTS.UC1xCBrygVPEwmmzLxSN_zNg) { // read-only: does the REST API that submit() uses accept the session (after a refresh)?
   const r = await rest('/api/submission/appeals/standing', campaign);
