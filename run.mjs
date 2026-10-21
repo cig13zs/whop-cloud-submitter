@@ -188,6 +188,7 @@ export async function whopCheck() { // read-only: does WHOP_CR_COOKIE still open
 export async function restCheck(campaign = DEFAULTS.UC1xCBrygVPEwmmzLxSN_zNg) { // read-only: does the REST API that submit() uses accept the session (after a refresh)?
   const r = await rest('/api/submission/appeals/standing', campaign);
   // No query params, so an accepted session answers 422 VALIDATION; only 401/403 mean the auth failed.
+  if (r.headers.get('cf-mitigated')) return `blocked (HTTP ${r.status} ${r.headers.get('cf-mitigated')})`;
   return r.status === 401 || r.status === 403 ? `HTTP ${r.status} ${(await r.json().catch(() => ({}))).error?.code || ''}`.trim() : `ok (HTTP ${r.status})`;
 }
 

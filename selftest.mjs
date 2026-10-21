@@ -47,10 +47,10 @@ globalThis.fetch = async (url, opt = {}) => {
     calls.push('refresh');
     return new Response('0:{}\n1:{"success":true}\n', { headers: [['set-cookie', '__Host-cr-session=fresh; Path=/; HttpOnly'], ['set-cookie', '__Host-cr-access=a2; Path=/']] });
   }
-  if (url.includes('apps.whop.com/c/exp_') && method === 'POST' && opt.headers['next-action'].startsWith('40ad8b5c')) {
-    checks++;
+  if (url.endsWith('apps.whop.com/api/submission/appeals/standing') && method === 'GET') { // whopCheck -> restCheck
+    if (calls.at(-1) !== 'refresh') checks++; // the retry right after a refresh is the same check
     if (session === 'cf') return new Response('<html>challenge</html>', { status: 403, headers: { 'cf-mitigated': 'challenge' } });
-    return new Response(`0:{}\n1:${JSON.stringify(session === 'ok' ? { data: [], success: true } : { code: 'UNAUTHORIZED', success: false })}\n`);
+    return session === 'ok' ? json({ error: { code: 'VALIDATION' }, success: false }, 422) : json({ error: { code: 'NOT_AUTHORIZED' }, success: false }, 401);
   }
   if (url.endsWith('apps.whop.com/api/submission/submissions') && method === 'POST') {
     assert.match(opt.headers.cookie, /__Host-cr-session=/);
@@ -59,7 +59,7 @@ globalThis.fetch = async (url, opt = {}) => {
     const vid = socialEntry(post)?.key || post.split('v=')[1];
     if (vid.startsWith('tt:') || vid.startsWith('ig:')) calls.push(`url ${post}`);
     calls.push(`submit ${vid}`);
-    const r = crResult[vid]?.stale && !/__Host-cr-session=fresh/.test(opt.headers.cookie)
+    const r = crResult[vid]?.stale && !calls.includes('refresh') // stale until this run refreshes (the cookie stays fresh across tests)
       ? { code: 'NOT_AUTHORIZED', error: 'Authentication required', success: false }
       : crResult[vid]?.stale ? { success: true } : crResult[vid]?.times === 0 ? { data: { id: 'sub_1' }, success: true } : crResult[vid] || { data: { id: 'sub_1' }, success: true };
     if (crResult[vid]?.times) crResult[vid].times--;
@@ -159,10 +159,11 @@ await test('dead Whop session or Cloudflare challenge: nothing is published, run
   for (session of ['unauth', 'cf']) {
     const state = {};
     const r = await run({ h1: { campaign: CAMP, at: '2026-10-01 11:50', channel: 'UCx' }, h2: { campaign: CAMP, at: '2026-10-01 11:55', channel: 'UCx2' } }, state);
-    assert.deepEqual(r.calls, [], 'a clip went public that could not be submitted');
+    // A 401 on the REST session check tries one refreshSession first; nothing may be published or submitted.
+    assert.deepEqual(r.calls.filter(c => c !== 'refresh'), [], 'a clip went public that could not be submitted');
     assert.equal(r.checks, 1, 'the session is checked once per run');
     assert.deepEqual(state, {});
-    assert.match(r.fatal.join(), session === 'cf' ? /whop session: blocked \(HTTP 403 challenge\)/ : /whop session: UNAUTHORIZED/);
+    assert.match(r.fatal.join(), session === 'cf' ? /whop session: blocked \(HTTP 403 challenge\)/ : /whop session: HTTP 401 NOT_AUTHORIZED/);
   }
   session = 'ok';
 });
