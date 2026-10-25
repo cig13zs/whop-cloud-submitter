@@ -94,6 +94,7 @@ export async function publish(vid, channel) {
     body: JSON.stringify({ id: vid, status: { ...status, privacyStatus: 'public', publishAt: null } }) });
   const d = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(`publish ${vid}: ${r.status} ${d.error?.errors?.[0]?.reason || ''}`);
+  if (d.status?.privacyStatus === 'public') await videoStatus(vid, channel);
   return d.status?.privacyStatus === 'public'; // the PUT echo; a GET read-back lags (ytapi, 2026-09-30)
 }
 
@@ -215,6 +216,7 @@ export function reconcileReceipts(queue, state, rows) {
     if (rec.whop_receipt?.receipt_id === r.id && rec.whop_receipt?.status === r.status && rec.whop_receipt?.review_status === r.reviewStatus && !rec.error) continue;
     if (rec.error) rec.previous_error = rec.error;
     delete rec.error;
+    delete rec.submission_terminal;
     rec.submitted = r.createdAt;
     rec.whop_receipt = { receipt_id: r.id, campaign_id: r.campaignId, post_url: r.socialMediaPost.postUrl,
       author_channel_id: r.socialMediaPost.authorId, submitted_at: r.createdAt, status: r.status, review_status: r.reviewStatus };
@@ -370,11 +372,15 @@ export async function candidates(queue, state, now, io) {
       try { ok = await net.publish(vid, q.channel); }
       catch (e) { io.log(`publish ${vid} failed: ${e.message}`); if (e.fatal) io.fatal.push(e.message); }
       if (ok) {
-        last[q.channel] = now;
-        (state[vid] ??= { campaign: q.campaign }).published = iso(now);
+        const since = publicTimes[vid] ? Date.parse(publicTimes[vid]) : now;
+        last[q.channel] = since;
+        const rec = state[vid] ??= { campaign: q.campaign };
+        rec.published = iso(since);
+        rec.released_at = iso(now);
         io.save(); // before the submit, so a crash can't lead to a second publish with a fresh window
         io.log(`published ${vid} (slot ${q.at})`);
-        out.set(vid, [q.campaign, now]);
+        if (now - since <= WINDOW) out.set(vid, [q.campaign, since]);
+        else { rec.submission_terminal = 'YouTube first-public timestamp predates the submission window'; io.save(); io.fatal.push(`${vid}: first-public timestamp already outside the submission window; never reupload`); }
       }
       continue;
     }
@@ -389,7 +395,7 @@ export async function plan(queue, state, now, io) {
   for (const r of Object.values(state)) if (r.submitted) used[r.campaign] = (used[r.campaign] || 0) + 1;
   const found = [...(await candidates(queue, state, now, io))].sort((a, b) => a[1][1] - b[1][1]);
   for (const [vid, [campaign, since]] of found) {
-    if (state[vid]?.submitted) continue;
+    if (state[vid]?.submitted || state[vid]?.submission_terminal) continue;
     let limit;
     try { limit = await net.cap(campaign); } catch (e) { io.log(`skip ${vid}: cap lookup failed (${e.message}), retry next run`); continue; }
     const n = (USED_BEFORE[campaign] || 0) + (used[campaign] || 0);
@@ -415,6 +421,10 @@ export async function pass(queue, state, now, io) {
     const rec = (state[vid] ??= { campaign });
     if (res.stage === 'submitted') { rec.submitted = iso(Date.now()); delete rec.error; if (res.note) rec.note = res.note; if (res.receipt) rec.whop_receipt = res.receipt; }
     else { rec.error = `${res.stage}: ${res.error || ''}`.trim(); if (['unauthorized', 'blocked'].includes(res.stage)) io.fatal.push(`${vid}: ${rec.error}`); }
+    if (res.stage === 'refused' && /within 30 minutes|past (?:that |the )?window/i.test(res.error || '')) {
+      rec.submission_terminal = 'Whop refused the posting-time window';
+      io.fatal.push(`${vid}: Whop refused the posting-time window; preserve the public video and reconcile its first-public time`);
+    }
     // D27 (10-12) and heje3041 (10-20): a TikTok CR can't read at 30 min stayed unreadable for the whole 3-h window while
     // oEmbed said public. Fail the run once so GitHub emails while there is still time to repost it directly.
     if (queue[vid]?.platform === 'tiktok' && /couldn't read/i.test(res.error || '') && age >= 30 && !rec.alerted) {

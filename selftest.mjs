@@ -193,7 +193,9 @@ await test('API refused (Content Rewards): refusal kept as error, not marked sub
   assert.deepEqual(r.calls, ['publish ref', 'submit ref']);
   assert.ok(!state.ref.submitted);
   assert.match(state.ref.error, /refused: BAD_REQUEST/);
-  assert.deepEqual(r.fatal, []);
+  assert.match(r.fatal.join(), /Whop refused the posting-time window/);
+  assert.ok(state.ref.submission_terminal);
+  assert.deepEqual((await run({ ref: { campaign: CAMP, at: '2026-10-01 11:59', channel: 'UCx' } }, state)).calls, []);
 });
 
 await test('dead Whop session or Cloudflare challenge: nothing is published, run fails loudly', async () => {
