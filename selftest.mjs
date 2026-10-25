@@ -1,7 +1,7 @@
 // Offline selftest for run.mjs: every HTTP call goes to a fake fetch, so the real request/parse code runs.
 // Cases: due, not-due, gap, 30-minute-expired, API-refused (YouTube and Content Rewards), duplicate, feed, cap, auth.
 import assert from 'node:assert/strict';
-import { mergeCookies, pass, slot, GAP, mergeLaptop, socialEntry, igPass, net, IG_VERSION, reconcileReceipts } from './run.mjs';
+import { mergeCookies, pass, slot, GAP, mergeLaptop, socialEntry, igPass, net, IG_VERSION, reconcileReceipts, discoverUnregistered } from './run.mjs';
 import { existsSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -79,6 +79,16 @@ async function run(queue, state, t = now) {
 }
 let cases = 0;
 const test = async (name, fn) => { console.log(`- ${name}`); await fn(); cases++; console.log('  ok'); };
+
+await test('channel feed discovers an unregistered public upload without guessing its campaign or submitting', async () => {
+  feedXml = `<feed><entry><yt:videoId>externalNew</yt:videoId><published>${new Date(now - 60000).toISOString()}</published></entry></feed>`;
+  const state = {}, queue = { known: { campaign: CAMP, channel: 'UCx' } }, io = { fatal: [], log() {}, save() {} };
+  assert.equal(await discoverUnregistered(queue, state, now, io), 1);
+  assert.equal(state.externalNew.source_channel, 'UCx'); assert.equal(state.externalNew.campaign, undefined);
+  assert.equal(queue.externalNew, undefined); assert.equal(io.fatal.length, 1);
+  assert.equal(await discoverUnregistered(queue, state, now, io), 0);
+  feedXml = '';
+});
 
 await test('monitor entries can never publish or submit; an early public clip raises an alert', async () => {
   const queue = { watch: { campaign: CAMP, at: '2026-10-01 13:00', source_channel: 'UCx', mode: 'monitor' } }, state = {};

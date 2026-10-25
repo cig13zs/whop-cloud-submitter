@@ -209,10 +209,11 @@ export function reconcileReceipts(queue, state, rows) {
     const vid = post?.platform && post.platform !== 'youtube' ? socialEntry(post.postUrl || '')?.key : post?.postId;
     if (!vid || !r.campaignId || !r.id || !r.createdAt) continue;
     const q = queue[vid];
-    const channel = q?.channel || q?.source_channel;
+    const channel = q?.channel || q?.source_channel || state[vid]?.source_channel;
     if ((q && r.campaignId !== q.campaign) || (channel && post.authorId !== channel)
       || (!q && state[vid]?.campaign && state[vid].campaign !== r.campaignId)) continue;
     const rec = state[vid] ??= { campaign: r.campaignId, ...(!q ? { receipt_only: true } : {}) };
+    rec.campaign ??= r.campaignId;
     if (rec.whop_receipt?.receipt_id === r.id && rec.whop_receipt?.status === r.status && rec.whop_receipt?.review_status === r.reviewStatus && !rec.error) continue;
     if (rec.error) rec.previous_error = rec.error;
     delete rec.error;
@@ -223,6 +224,22 @@ export function reconcileReceipts(queue, state, rows) {
     changed++;
   }
   return changed;
+}
+
+export async function discoverUnregistered(queue, state, now, io) {
+  const channels = [...new Set(Object.values(queue).map(q => q.channel || q.source_channel).filter(Boolean))];
+  let added = 0;
+  await Promise.all(channels.map(async channel => {
+    try {
+      for (const [vid, at] of await net.feed(channel)) {
+        if (queue[vid] || state[vid]?.submitted || state[vid]?.unmapped_public_at || now < at || now - at > 24 * 3600e3) continue;
+        state[vid] = { ...state[vid], source_channel: channel, unmapped_public_at: iso(at), coverage_alert: iso(now) };
+        added++;
+      }
+    } catch (e) { io.log(`upload coverage feed read failed: ${e.message}`); }
+  }));
+  if (added) { io.save(); io.log(`detected ${added} public uploads outside the submission queue`); io.fatal.push('Unregistered public uploads need exact campaign/source/review records; no publish or submit permission inferred'); }
+  return added;
 }
 
 // Content Rewards dropped listMySubmissionsAction (~10-21), which held every clip as "session dead". The session check
@@ -569,6 +586,7 @@ async function main() {
     io.whop = 'receipt reconciliation unavailable';
     if (!dry) { process.exitCode = 1; return; }
   }
+  if (!dry) await discoverUnregistered(queue, state, Date.now(), io);
   if (dry) {
     io.log(`whop session: ${await whopCheck()}`);
     io.log(`whop rest api: ${await restCheck()}`);
