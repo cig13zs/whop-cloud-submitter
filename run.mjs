@@ -208,7 +208,7 @@ export function reconcileReceipts(queue, state, rows) {
     const channel = q?.channel || q?.source_channel;
     if (!q || r.campaignId !== q.campaign || (channel && r.socialMediaPost?.authorId !== channel) || !r.id || !r.createdAt) continue;
     const rec = state[vid] ??= { campaign: q.campaign };
-    if (rec.whop_receipt?.receipt_id === r.id && rec.whop_receipt?.status === r.status && !rec.error) continue;
+    if (rec.whop_receipt?.receipt_id === r.id && rec.whop_receipt?.status === r.status && rec.whop_receipt?.review_status === r.reviewStatus && !rec.error) continue;
     if (rec.error) rec.previous_error = rec.error;
     delete rec.error;
     rec.submitted = r.createdAt;
@@ -544,6 +544,7 @@ async function main() {
     io.log(e.message);
     io.fatal.push('receipt reconciliation unavailable; holding new publications');
     io.whop = 'receipt reconciliation unavailable';
+    if (!dry) { process.exitCode = 1; return; }
   }
   if (dry) {
     io.log(`whop session: ${await whopCheck()}`);
