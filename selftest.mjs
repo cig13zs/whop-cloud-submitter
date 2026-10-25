@@ -98,6 +98,11 @@ await test('actual receipts bind campaign and author, clear duplicate errors, an
   assert.equal(reconcileReceipts(q, s, [receipt]), 1);
   assert.equal(s.got.whop_receipt.receipt_id, 'r-real'); assert.equal(s.got.whop_receipt.status, 'rejected'); assert.ok(!s.got.error);
   assert.equal(reconcileReceipts(q, s, [receipt]), 0);
+  const external = { ...receipt, id: 'r-outside', socialMediaPost: { ...receipt.socialMediaPost, postId: 'outsideQueue', platform: 'youtube' } };
+  assert.equal(reconcileReceipts(q, s, [external]), 1);
+  assert.equal(s.outsideQueue.receipt_only, true);
+  assert.equal(s.outsideQueue.whop_receipt.receipt_id, 'r-outside');
+  assert.ok(!q.outsideQueue);
 });
 
 await test('due: a held clip past its slot is published, then submitted in the same pass', async () => {

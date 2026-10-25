@@ -204,10 +204,14 @@ export async function readReceipts() {
 export function reconcileReceipts(queue, state, rows) {
   let changed = 0;
   for (const r of rows) {
-    const vid = r.socialMediaPost?.postId, q = queue[vid];
+    const post = r.socialMediaPost;
+    const vid = post?.platform && post.platform !== 'youtube' ? socialEntry(post.postUrl || '')?.key : post?.postId;
+    if (!vid || !r.campaignId || !r.id || !r.createdAt) continue;
+    const q = queue[vid];
     const channel = q?.channel || q?.source_channel;
-    if (!q || r.campaignId !== q.campaign || (channel && r.socialMediaPost?.authorId !== channel) || !r.id || !r.createdAt) continue;
-    const rec = state[vid] ??= { campaign: q.campaign };
+    if ((q && r.campaignId !== q.campaign) || (channel && post.authorId !== channel)
+      || (!q && state[vid]?.campaign && state[vid].campaign !== r.campaignId)) continue;
+    const rec = state[vid] ??= { campaign: r.campaignId, ...(!q ? { receipt_only: true } : {}) };
     if (rec.whop_receipt?.receipt_id === r.id && rec.whop_receipt?.status === r.status && rec.whop_receipt?.review_status === r.reviewStatus && !rec.error) continue;
     if (rec.error) rec.previous_error = rec.error;
     delete rec.error;
