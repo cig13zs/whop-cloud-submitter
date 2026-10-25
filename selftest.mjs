@@ -13,7 +13,7 @@ let session = 'ok', checks = 0, feedXml = '', publicVids = new Set(), crResult =
 const publishedDates = new Map();
 process.env.WHOP_CR_COOKIE = '__Host-cr-session=fake; __Host-cr-whop-id=fake';
 process.env.YT_CLIENT = JSON.stringify({ client_id: 'id', client_secret: 'sec' });
-process.env.YT_REFRESH_TOKENS = JSON.stringify({ UCx: 'rt-x', UCx2: 'rt-x', UCy: 'rt-y' });
+process.env.YT_REFRESH_TOKENS = JSON.stringify({ UCx: 'rt-x', UCx2: 'rt-x', UCy: 'rt-y', UCpodcast: 'rt-x' });
 
 const json = (body, status = 200, headers = {}) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', ...headers } });
 globalThis.fetch = async (url, opt = {}) => {
@@ -120,6 +120,15 @@ await test('not due: a held clip before its slot is left alone', async () => {
   const r = await run({ later: { campaign: CAMP, at: '2026-10-01 12:30', channel: 'UCx' } }, state);
   assert.deepEqual(r.calls, []);
   assert.deepEqual(state, {});
+});
+
+await test('Podcast channel honors six-hour gaps and three daily posts across campaigns', async () => {
+  const channel = 'UCpodcast', queue = { podcastNext: { campaign: CAMP, at: '2026-10-01 11:00', channel, min_gap_minutes: 360, max_posts_per_manila_day: 3 } };
+  const recent = { old: { campaign: 'another-campaign', published: new Date(now - 5 * 3600e3).toISOString(), whop_receipt: { author_channel_id: channel } } };
+  assert.deepEqual((await run(queue, recent)).calls, []);
+  const full = Object.fromEntries([0, 1, 2].map((h, i) => ['old' + i, { campaign: 'different-' + i, published: new Date(slot('2026-10-01 00:00') + h * 3600e3).toISOString(), whop_receipt: { author_channel_id: channel } }]));
+  assert.deepEqual((await run(queue, full)).calls, []);
+  assert.deepEqual((await run(queue, full, now + 24 * 3600e3)).calls, ['publish podcastNext', 'submit podcastNext']);
 });
 
 await test('early: a held clip made public before its slot is submitted without another publish', async () => {

@@ -325,6 +325,11 @@ export async function candidates(queue, state, now, io) {
   const pub = vid => state[vid]?.published || queue[vid].published;
   const last = {}; // latest publish per channel, for GAP: after a long outage held clips go out one per channel per GAP
   for (const [vid, q] of Object.entries(queue)) if (q.channel && pub(vid)) last[q.channel] = Math.max(last[q.channel] || 0, Date.parse(pub(vid)));
+  const rules = Object.fromEntries(Object.values(queue).filter(q => q.channel && (q.min_gap_minutes || q.max_posts_per_manila_day)).map(q => [q.channel, q]));
+  const postingTime = r => Date.parse(r.released_at || r.published || r.whop_receipt?.submitted_at || '');
+  const author = (vid, r) => queue[vid]?.channel || queue[vid]?.source_channel || r.whop_receipt?.author_channel_id;
+  const manilaDay = t => new Date(t + 8 * 3600e3).toISOString().slice(0, 10);
+  for (const [vid, r] of Object.entries(state)) if (rules[author(vid, r)] && Number.isFinite(postingTime(r))) { const ch = author(vid, r); last[ch] = Math.max(last[ch] || 0, postingTime(r)); }
   for (const [vid, q] of Object.entries(queue).sort((a, b) => a[1].at.localeCompare(b[1].at))) {
     if (state[vid]?.submitted) { out.delete(vid); continue; }
     if (q.mode === 'monitor') {
@@ -358,7 +363,11 @@ export async function candidates(queue, state, now, io) {
       continue;
     }
     if (q.channel && !pub(vid) && now >= at) {
-      if (last[q.channel] && now - last[q.channel] < GAP) continue;
+      const rule = rules[q.channel] || {};
+      const gap = rule.min_gap_minutes ? rule.min_gap_minutes * 60000 : GAP;
+      if (last[q.channel] && now - last[q.channel] < gap) continue;
+      if (rule.max_posts_per_manila_day && Object.entries(state).filter(([id, r]) => author(id, r) === q.channel
+        && Number.isFinite(postingTime(r)) && manilaDay(postingTime(r)) === manilaDay(now)).length >= rule.max_posts_per_manila_day) continue;
       // A paused or capped campaign can't take the submit, so publishing would burn the clip's 30-minute window for
       // nothing (TIyZahZmFZE, TV Pilot #1 paused, 2026-10-02). Keep it private until the campaign reopens.
       if (!(await open(q.campaign, state, io))) continue;
