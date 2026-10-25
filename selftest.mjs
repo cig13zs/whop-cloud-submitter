@@ -10,6 +10,7 @@ const CAMP = 'camp-1', SARTAIN = '86842687-ba2b-4638-a024-995dcf3d25a3';
 const now = slot('2026-10-01 12:00');
 const calls = [];
 let session = 'ok', checks = 0, feedXml = '', publicVids = new Set(), crResult = {}, ytPutFail = new Set(), campaignStatus = {};
+const publishedDates = new Map();
 process.env.WHOP_CR_COOKIE = '__Host-cr-session=fake; __Host-cr-whop-id=fake';
 process.env.YT_CLIENT = JSON.stringify({ client_id: 'id', client_secret: 'sec' });
 process.env.YT_REFRESH_TOKENS = JSON.stringify({ UCx: 'rt-x', UCx2: 'rt-x', UCy: 'rt-y' });
@@ -30,7 +31,7 @@ globalThis.fetch = async (url, opt = {}) => {
     const rt = new URLSearchParams(opt.body).get('refresh_token');
     return rt === 'rt-x' ? json({ access_token: 'at-x', expires_in: 3600 }) : json({ error: 'invalid_grant' }, 400);
   }
-  if (url.includes('youtube/v3/videos') && method === 'GET') { const id = new URL(url).searchParams.get('id'); return json({ items: [{ status: { privacyStatus: publicVids.has(id) ? 'public' : 'private', madeForKids: false }, snippet: { publishedAt: new Date(now - 60000).toISOString() } }] }); }
+  if (url.includes('youtube/v3/videos') && method === 'GET') { const id = new URL(url).searchParams.get('id'); return json({ items: [{ status: { privacyStatus: publicVids.has(id) ? 'public' : 'private', madeForKids: false }, snippet: { publishedAt: new Date(publishedDates.get(id) ?? now - 60000).toISOString() } }] }); }
   if (url.includes('youtube/v3/videos') && method === 'PUT') {
     const body = JSON.parse(opt.body);
     calls.push(`publish ${body.id}`);
@@ -123,6 +124,18 @@ await test('early: a held clip made public before its slot is submitted without 
   assert.deepEqual(r.calls, ['submit early']);
   assert.ok(state.early.published && state.early.submitted);
   publicVids = new Set();
+});
+
+await test('existing public clips keep the actual time even after the saved slot, never another publish', async () => {
+  publicVids = new Set(['manualDue', 'expiredManual']);
+  publishedDates.set('expiredManual', now - 31 * 60000);
+  const state = {};
+  const r = await run({ manualDue: { campaign: CAMP, at: '2026-10-01 11:50', channel: 'UCx' }, expiredManual: { campaign: CAMP, at: '2026-10-02 12:00', channel: 'UCx' } }, state);
+  assert.deepEqual(r.calls, ['submit manualDue']);
+  assert.equal(Date.parse(state.manualDue.published), now - 60000);
+  assert.equal(Date.parse(state.expiredManual.published), now - 31 * 60000);
+  assert.ok(!state.expiredManual.submitted);
+  publicVids = new Set(); publishedDates.clear();
 });
 
 await test('gap: two due clips on one channel go out GAP apart, not together', async () => {
