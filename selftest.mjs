@@ -1,7 +1,7 @@
 // Offline selftest for run.mjs: every HTTP call goes to a fake fetch, so the real request/parse code runs.
 // Cases: due, not-due, gap, 30-minute-expired, API-refused (YouTube and Content Rewards), duplicate, feed, cap, auth.
 import assert from 'node:assert/strict';
-import { mergeCookies, pass, slot, GAP, mergeLaptop, socialEntry, igPass, net, IG_VERSION } from './run.mjs';
+import { mergeCookies, pass, slot, GAP, mergeLaptop, socialEntry, igPass, net, IG_VERSION, reconcileReceipts } from './run.mjs';
 import { existsSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -30,7 +30,7 @@ globalThis.fetch = async (url, opt = {}) => {
     const rt = new URLSearchParams(opt.body).get('refresh_token');
     return rt === 'rt-x' ? json({ access_token: 'at-x', expires_in: 3600 }) : json({ error: 'invalid_grant' }, 400);
   }
-  if (url.includes('youtube/v3/videos') && method === 'GET') return json({ items: [{ status: { privacyStatus: 'private', madeForKids: false } }] });
+  if (url.includes('youtube/v3/videos') && method === 'GET') { const id = new URL(url).searchParams.get('id'); return json({ items: [{ status: { privacyStatus: publicVids.has(id) ? 'public' : 'private', madeForKids: false }, snippet: { publishedAt: new Date(now - 60000).toISOString() } }] }); }
   if (url.includes('youtube/v3/videos') && method === 'PUT') {
     const body = JSON.parse(opt.body);
     calls.push(`publish ${body.id}`);
@@ -79,11 +79,34 @@ async function run(queue, state, t = now) {
 let cases = 0;
 const test = async (name, fn) => { console.log(`- ${name}`); await fn(); cases++; console.log('  ok'); };
 
+await test('monitor entries can never publish or submit; an early public clip raises an alert', async () => {
+  const queue = { watch: { campaign: CAMP, at: '2026-10-01 13:00', source_channel: 'UCx', mode: 'monitor' } }, state = {};
+  assert.deepEqual((await run(queue, state)).calls, []);
+  publicVids = new Set(['watch']);
+  const r = await run(queue, state);
+  assert.deepEqual(r.calls, []); assert.equal(r.fatal.length, 1); assert.ok(state.watch.coverage_alert);
+  assert.equal((await run(queue, state)).fatal.length, 0);
+  publicVids = new Set();
+});
+
+await test('actual receipts bind campaign and author, clear duplicate errors, and keep rejection distinct', async () => {
+  const q = { got: { campaign: CAMP, source_channel: 'UCx', mode: 'monitor' } }, s = { got: { error: 'duplicate failure' } };
+  const receipt = { id: 'r-real', campaignId: CAMP, createdAt: '2026-10-01T03:58:00Z', status: 'rejected', reviewStatus: 'reviewed', socialMediaPost: { postId: 'got', authorId: 'UCx', postUrl: 'https://youtube.com/watch?v=got' } };
+  assert.equal(reconcileReceipts(q, s, [{ ...receipt, campaignId: 'other' }]), 0);
+  assert.equal(reconcileReceipts(q, s, [{ ...receipt, socialMediaPost: { ...receipt.socialMediaPost, authorId: 'other' } }]), 0);
+  assert.equal(reconcileReceipts(q, s, [receipt]), 1);
+  assert.equal(s.got.whop_receipt.receipt_id, 'r-real'); assert.equal(s.got.whop_receipt.status, 'rejected'); assert.ok(!s.got.error);
+  assert.equal(reconcileReceipts(q, s, [receipt]), 0);
+});
+
 await test('due: a held clip past its slot is published, then submitted in the same pass', async () => {
   const state = {};
   const r = await run({ due: { campaign: CAMP, at: '2026-10-01 11:55', channel: 'UCx' } }, state);
   assert.deepEqual(r.calls, ['publish due', 'submit due']);
   assert.ok(state.due.published && state.due.submitted && !state.due.error);
+  assert.equal(state.due.whop_receipt.receipt_id, 'sub_1');
+  assert.equal(state.due.whop_receipt.campaign_id, CAMP);
+  assert.equal(state.due.whop_receipt.post_url, 'https://www.youtube.com/watch?v=due');
 });
 
 await test('not due: a held clip before its slot is left alone', async () => {
@@ -93,7 +116,7 @@ await test('not due: a held clip before its slot is left alone', async () => {
   assert.deepEqual(state, {});
 });
 
-await test('early: a held clip Lorence made public before its slot is submitted now, not published again', async () => {
+await test('early: a held clip made public before its slot is submitted without another publish', async () => {
   publicVids = new Set(['early']);
   const state = {};
   const r = await run({ early: { campaign: CAMP, at: '2026-10-02 18:00', channel: 'UCx' } }, state);
@@ -196,6 +219,19 @@ await test('duplicate: Content Rewards says already submitted -> recorded as sub
   publicVids = new Set(['dup']);
   assert.deepEqual((await run({ dup: { campaign: CAMP, at: '2026-10-01 11:59', channel: 'UCx' } }, state)).calls, []);
   crResult = {};
+});
+
+await test('duplicate: current already been submitted wording clears the stale failure', async () => {
+  crResult = { dupBeen: { code: 'CONFLICT', error: 'This post has already been submitted to the campaign', success: false } };
+  publicVids = new Set(['dupBeen']);
+  const state = { dupBeen: { campaign: CAMP, published: new Date(now - 60000).toISOString(), error: 'old failure' } };
+  const queue = { dupBeen: { campaign: CAMP, at: '2026-10-01 11:59' } };
+  await run(queue, state);
+  assert.ok(state.dupBeen.submitted);
+  assert.equal(state.dupBeen.note, 'duplicate');
+  assert.ok(!state.dupBeen.error);
+  assert.deepEqual((await run(queue, state)).calls, []);
+  crResult = {}; publicVids = new Set();
 });
 
 await test("publish time not confirmed yet: retried in the same run, then submitted", async () => {

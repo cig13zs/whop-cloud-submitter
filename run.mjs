@@ -53,13 +53,16 @@ export async function isPublic(vid, q = {}, now = Date.now()) { // oEmbed answer
     const ok = await fetch(`https://www.tiktok.com/oembed?url=${encodeURIComponent(q.url)}`, { headers: { 'user-agent': UA } }).then(r => r.ok, () => false);
     return ok || (q.scheduled === true && now >= slot(q.at) + 2 * 60e3);
   }
-  // ponytail: Instagram has no cookieless public check (oEmbed needs a Meta app token; profile/embed pages are login
+  // Instagram has no cookieless public check (oEmbed needs a Meta app token; profile/embed pages are login
   // walls from outside). Instagram entries are queued only once the laptop has seen the Reel live, so trust that.
   if (q.platform === 'instagram') return true;
+  const channel = q.channel || q.source_channel;
+  if (channel) return (await videoStatus(vid, channel)).privacyStatus === 'public';
   return (await fetch(`https://www.youtube.com/oembed?format=json&url=https://www.youtube.com/shorts/${vid}`, { headers: { 'user-agent': UA } })).ok;
 }
 
 const access = {};
+const publicTimes = {};
 async function ytToken(channel) {
   if (access[channel]) return access[channel];
   const client = JSON.parse(process.env.YT_CLIENT || '{}');
@@ -74,10 +77,11 @@ async function ytToken(channel) {
 }
 
 async function videoStatus(vid, channel) {
-  const r = await fetch(`${YT}videos?part=status&id=${encodeURIComponent(vid)}`, { headers: { authorization: `Bearer ${await ytToken(channel)}` } });
+  const r = await fetch(`${YT}videos?part=status,snippet&id=${encodeURIComponent(vid)}`, { headers: { authorization: `Bearer ${await ytToken(channel)}` } });
   const d = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(`read ${vid}: ${r.status} ${d.error?.errors?.[0]?.reason || ''}`);
   const status = d.items?.[0]?.status;
+  if (status?.privacyStatus === 'public' && d.items[0].snippet?.publishedAt) publicTimes[vid] = d.items[0].snippet.publishedAt;
   if (!status) throw new Error(`video ${vid} not found on ${channel}`);
   return status;
 }
@@ -113,7 +117,7 @@ export async function actionId(name) {
   if (!page.ok) throw Object.assign(new Error(`Content Rewards is down (HTTP ${page.status}); holding everything`), { fatal: true });
   const html = await page.text();
   const queue = [...html.matchAll(/\/c\/_next\/static\/chunks\/[\w.\-/]+?\.js/g)].map(m => m[0]), seen = new Set();
-  while (queue.length && seen.size < 400) { // ponytail: plain BFS over ~80 chunks (~10 s); cache ids if it gets slow
+  while (queue.length && seen.size < 400) { // plain BFS over ~80 chunks (~10 s); cache ids if it gets slow
     const p = queue.shift();
     if (seen.has(p)) continue;
     seen.add(p);
@@ -173,10 +177,46 @@ export async function submit(vid, campaign, url = `https://www.youtube.com/watch
   const r = await rest('/api/submission/submissions', campaign, { method: 'POST', body: JSON.stringify({ campaignId: campaign, url }) });
   const res = await r.json().catch(() => null);
   if (r.headers.get('cf-mitigated') || !res) return { stage: 'blocked', error: `HTTP ${r.status} ${r.headers.get('cf-mitigated') || 'no JSON'}` };
-  if (res.success) return { stage: 'submitted' };
+  if (res.success) return { stage: 'submitted', ...(res.data?.id ? { receipt: { receipt_id: res.data.id,
+    campaign_id: campaign, post_url: url, submitted_at: res.data.createdAt || null,
+    status: res.data.status || null, review_status: res.data.reviewStatus || null } } : {}) };
   const { code, message } = res.error || {};
-  if (/DUPLICATE/.test(code) || /already submitted/i.test(message)) return { stage: 'submitted', note: 'duplicate' }; // already in, e.g. by the laptop
+  if (/DUPLICATE/.test(code) || /already (?:been )?submitted/i.test(message)) return { stage: 'submitted', note: 'duplicate' }; // already in, e.g. by the laptop
   return { stage: r.status === 401 || /AUTHORIZED/.test(code) ? 'unauthorized' : 'refused', error: `${code}: ${message}` };
+}
+
+export async function readReceipts() {
+  const rows = [], seen = new Set();
+  let cursor;
+  for (let page = 0; page < 20; page++) {
+    const r = await rest('/api/submission/submissions?limit=100&creatorView=true' + (cursor ? '&cursor=' + encodeURIComponent(cursor) : ''), DEFAULTS.UC1xCBrygVPEwmmzLxSN_zNg);
+    const data = await r.json().catch(() => null);
+    if (!r.ok || data?.success !== true || !Array.isArray(data.data)) throw new Error(`receipt read failed: HTTP ${r.status}`);
+    rows.push(...data.data);
+    cursor = data.pagination?.nextCursor;
+    if (!cursor) return rows;
+    if (seen.has(cursor)) throw new Error('receipt pagination repeated a cursor');
+    seen.add(cursor);
+  }
+  throw new Error('receipt pagination exceeded 20 pages');
+}
+
+export function reconcileReceipts(queue, state, rows) {
+  let changed = 0;
+  for (const r of rows) {
+    const vid = r.socialMediaPost?.postId, q = queue[vid];
+    const channel = q?.channel || q?.source_channel;
+    if (!q || r.campaignId !== q.campaign || (channel && r.socialMediaPost?.authorId !== channel) || !r.id || !r.createdAt) continue;
+    const rec = state[vid] ??= { campaign: q.campaign };
+    if (rec.whop_receipt?.receipt_id === r.id && rec.whop_receipt?.status === r.status && !rec.error) continue;
+    if (rec.error) rec.previous_error = rec.error;
+    delete rec.error;
+    rec.submitted = r.createdAt;
+    rec.whop_receipt = { receipt_id: r.id, campaign_id: r.campaignId, post_url: r.socialMediaPost.postUrl,
+      author_channel_id: r.socialMediaPost.authorId, submitted_at: r.createdAt, status: r.status, review_status: r.reviewStatus };
+    changed++;
+  }
+  return changed;
 }
 
 // Content Rewards dropped listMySubmissionsAction (~10-21), which held every clip as "session dead". The session check
@@ -224,7 +264,7 @@ export const net = { feed, isPublic, cap, publish, submit, whopCheck, ig: {
   // required" (probe run 37201477081, 2026-10-04). Meta fetches the file itself from link() below.
   create: (id, caption, videoUrl) => igPost(`${id}/media`, { media_type: 'REELS', video_url: videoUrl, caption, share_to_feed: 'true' }),
   // A short-lived signed download URL for a private ig-media asset (the API's octet-stream redirect), never stored.
-  // ponytail: the signed URL lives ~5 min and Meta fetches on create; host the files publicly if fetches start failing.
+  // the signed URL lives ~5 min and Meta fetches on create; host the files publicly if fetches start failing.
   link: async asset => {
     let rel;
     try { rel = JSON.parse(execFileSync('gh', ['api', `repos/${REPO}/releases/tags/ig-media`], { env: process.env, windowsHide: true, stdio: 'pipe', timeout: 60_000 })); }
@@ -280,17 +320,30 @@ export async function candidates(queue, state, now, io) {
   const last = {}; // latest publish per channel, for GAP: after a long outage held clips go out one per channel per GAP
   for (const [vid, q] of Object.entries(queue)) if (q.channel && pub(vid)) last[q.channel] = Math.max(last[q.channel] || 0, Date.parse(pub(vid)));
   for (const [vid, q] of Object.entries(queue).sort((a, b) => a[1].at.localeCompare(b[1].at))) {
+    if (state[vid]?.submitted) { out.delete(vid); continue; }
+    if (q.mode === 'monitor') {
+      out.delete(vid);
+      let visible = false;
+      try { visible = await net.isPublic(vid, q, now); }
+      catch (e) { if (!state[vid]?.coverage_error) { (state[vid] ??= { campaign: q.campaign }).coverage_error = iso(now); io.save(); io.fatal.push(`monitored clip ${vid} cannot verify visibility: ${e.message}`); } }
+      if (visible && !state[vid]?.coverage_alert) {
+        (state[vid] ??= { campaign: q.campaign }).coverage_alert = iso(now);
+        io.save();
+        io.fatal.push(`public monitored clip ${vid} needs release checks and receipt reconciliation; never republish`);
+      }
+      continue;
+    }
     if (q.mode === 'api') { out.delete(vid); continue; }
     if (out.has(vid)) continue;
     const at = slot(q.at);
-    // Lorence sometimes makes a held clip public by hand before its slot ("i just set the scheduled post to public
-    // instantly even if it will be posted tomorrow", 2026-10-20). The first run that sees it public stamps it and submits.
-    if (q.channel && !pub(vid) && now < at && await net.isPublic(vid, q, now)) {
-      (state[vid] ??= { campaign: q.campaign }).published = iso(now);
+    // A held clip can be made public manually before its slot. Detect its actual public time and submit.
+    if (q.channel && !pub(vid) && await net.isPublic(vid, q, now)) {
+      const since = publicTimes[vid] ? Date.parse(publicTimes[vid]) : now;
+      (state[vid] ??= { campaign: q.campaign }).published = iso(since);
       io.save();
-      io.log(`${vid} went public early by hand (slot ${q.at})`);
-      last[q.channel] = now;
-      out.set(vid, [q.campaign, now]);
+      io.log(`detected existing public video ${vid} (slot ${q.at})`);
+      last[q.channel] = since;
+      if (now - since <= WINDOW) out.set(vid, [q.campaign, since]);
       continue;
     }
     if (q.channel && !pub(vid) && now >= at) {
@@ -351,7 +404,7 @@ export async function pass(queue, state, now, io) {
     }
     io.log(`${vid} -> ${campaign}: ${res.stage}${res.note ? ` (${res.note})` : ''}${res.error ? ` ${res.error}` : ''} (public ${age} min)`);
     const rec = (state[vid] ??= { campaign });
-    if (res.stage === 'submitted') { rec.submitted = iso(Date.now()); delete rec.error; if (res.note) rec.note = res.note; }
+    if (res.stage === 'submitted') { rec.submitted = iso(Date.now()); delete rec.error; if (res.note) rec.note = res.note; if (res.receipt) rec.whop_receipt = res.receipt; }
     else { rec.error = `${res.stage}: ${res.error || ''}`.trim(); if (['unauthorized', 'blocked'].includes(res.stage)) io.fatal.push(`${vid}: ${rec.error}`); }
     // D27 (10-12) and heje3041 (10-20): a TikTok CR can't read at 30 min stayed unreadable for the whole 3-h window while
     // oEmbed said public. Fail the run once so GitHub emails while there is still time to repost it directly.
@@ -377,7 +430,7 @@ export async function igPass(queue, state, now, io) {
   }
   // Token age: a refresh returns a *new* token (the old one keeps its own 60-day expiry), so comparing it to IG_TOKEN
   // always failed (2026-10-04). Track when this token (by hash, never the value) was first seen and warn from day 50.
-  // ponytail: the runner can't rewrite its own secret; upgrade path is a PAT secret plus the secrets API.
+  // the runner can't rewrite its own secret; upgrade path is a PAT secret plus the secrets API.
   const hash = createHash('sha256').update(process.env.IG_TOKEN).digest('hex').slice(0, 12);
   if (state._igtoken?.hash !== hash && !io.dry) { state._igtoken = { hash, since: iso(now) }; io.save(); }
   const age = (now - Date.parse(state._igtoken?.since || iso(now))) / 864e5;
@@ -474,10 +527,19 @@ async function main() {
   // Public repo: Actions logs are public too, so mask every clip, campaign, channel and post id before anything prints.
   if (process.env.GITHUB_ACTIONS)
     for (const [vid, q] of [...Object.entries(queue), ...Object.entries(state)])
-      for (const v of [vid, vid.replace(/^\w+:/, ''), q.campaign, q.channel, q.url, q.permalink]) if (v && String(v).length > 5) console.log(`::add-mask::${v}`);
+      for (const v of [vid, vid.replace(/^\w+:/, ''), q.campaign, q.channel, q.source_channel, q.url, q.permalink]) if (v && String(v).length > 5) console.log(`::add-mask::${v}`);
   // STATE_OUT: a laptop run (refresh-session.mjs --local) saves to laptop-state.json, so each file keeps one writer.
   const io = { dry, log: m => console.log(`${new Date().toISOString().slice(0, 19)}Z ${m}`), fatal: [],
     save: () => dry || writeFileSync(path.join(DIR, process.env.STATE_OUT || 'state.json'), JSON.stringify(state, null, 1) + '\n') };
+  try {
+    const rows = await readReceipts();
+    if (!dry) { const n = reconcileReceipts(queue, state, rows); if (n) { io.save(); io.log(`reconciled ${n} existing submission receipts`); } }
+    else io.log(`receipt reconciliation readable: ${rows.length} records`);
+  } catch (e) {
+    io.log(e.message);
+    io.fatal.push('receipt reconciliation unavailable; holding new publications');
+    io.whop = 'receipt reconciliation unavailable';
+  }
   if (dry) {
     io.log(`whop session: ${await whopCheck()}`);
     io.log(`whop rest api: ${await restCheck()}`);
