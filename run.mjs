@@ -337,7 +337,12 @@ export async function candidates(queue, state, now, io) {
     if (out.has(vid)) continue;
     const at = slot(q.at);
     // A held clip can be made public manually before its slot. Detect its actual public time and submit.
-    if (q.channel && !pub(vid) && await net.isPublic(vid, q, now)) {
+    let visible = false;
+    if (q.channel && !pub(vid)) {
+      try { visible = await net.isPublic(vid, q, now); }
+      catch (e) { io.log(`visibility read ${vid} failed: ${e.message}`); io.fatal.push(`${vid}: ${e.message}`); continue; }
+    }
+    if (q.channel && !pub(vid) && visible) {
       const since = publicTimes[vid] ? Date.parse(publicTimes[vid]) : now;
       (state[vid] ??= { campaign: q.campaign }).published = iso(since);
       io.save();
