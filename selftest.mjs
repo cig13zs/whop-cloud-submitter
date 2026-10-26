@@ -1,7 +1,7 @@
 // Offline selftest for run.mjs: every HTTP call goes to a fake fetch, so the real request/parse code runs.
 // Cases: due, not-due, gap, 30-minute-expired, API-refused (YouTube and Content Rewards), duplicate, feed, cap, auth.
 import assert from 'node:assert/strict';
-import { mergeCookies, pass, slot, GAP, mergeLaptop, socialEntry, igPass, net, IG_VERSION, reconcileReceipts, discoverUnregistered } from './run.mjs';
+import { mergeCookies, pass, slot, GAP, mergeLaptop, socialEntry, igPass, net, IG_VERSION, reconcileReceipts, discoverUnregistered, readVisibility } from './run.mjs';
 import { existsSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -11,6 +11,7 @@ const now = slot('2026-10-01 12:00');
 const calls = [];
 let session = 'ok', checks = 0, feedXml = '', publicVids = new Set(), crResult = {}, ytPutFail = new Set(), campaignStatus = {};
 const publishedDates = new Map();
+let videoReads = 0, quotaFailed = false, missingVideos = new Set();
 process.env.WHOP_CR_COOKIE = '__Host-cr-session=fake; __Host-cr-whop-id=fake';
 process.env.YT_CLIENT = JSON.stringify({ client_id: 'id', client_secret: 'sec' });
 process.env.YT_REFRESH_TOKENS = JSON.stringify({ UCx: 'rt-x', UCx2: 'rt-x', UCy: 'rt-y', UCpodcast: 'rt-x' });
@@ -31,7 +32,13 @@ globalThis.fetch = async (url, opt = {}) => {
     const rt = new URLSearchParams(opt.body).get('refresh_token');
     return rt === 'rt-x' ? json({ access_token: 'at-x', expires_in: 3600 }) : json({ error: 'invalid_grant' }, 400);
   }
-  if (url.includes('youtube/v3/videos') && method === 'GET') { const id = new URL(url).searchParams.get('id'); return json({ items: [{ status: { privacyStatus: publicVids.has(id) ? 'public' : 'private', madeForKids: false }, snippet: { publishedAt: new Date(publishedDates.get(id) ?? now - 60000).toISOString() } }] }); }
+  if (url.includes('youtube/v3/videos') && method === 'GET') {
+    videoReads++;
+    if (quotaFailed) return json({ error: { errors: [{ reason: 'quotaExceeded' }] } }, 403);
+    const ids = new URL(url).searchParams.get('id').split(',');
+    assert.ok(ids.length <= 50);
+    return json({ items: ids.filter(id => !missingVideos.has(id)).map(id => ({ id, status: { privacyStatus: publicVids.has(id) ? 'public' : 'private', madeForKids: false }, snippet: { publishedAt: new Date(publishedDates.get(id) ?? now - 60000).toISOString() } })) });
+  }
   if (url.includes('youtube/v3/videos') && method === 'PUT') {
     const body = JSON.parse(opt.body);
     calls.push(`publish ${body.id}`);
@@ -80,6 +87,57 @@ async function run(queue, state, t = now) {
 let cases = 0;
 const test = async (name, fn) => { console.log(`- ${name}`); await fn(); cases++; console.log('  ok'); };
 
+await test('visibility batches 101 videos into three reads and caches only advisory checks for 15 minutes', async () => {
+  const queue = Object.fromEntries(Array.from({ length: 101 }, (_, i) => ['batch' + i,
+    { campaign: CAMP, at: '2026-10-02 12:00', source_channel: 'UCx', mode: 'monitor' }]));
+  const state = {}, io = { dry: false, log() {}, save() {} };
+  videoReads = 0;
+  assert.equal((await readVisibility(queue, state, now, io)).size, 101);
+  assert.equal(videoReads, 3);
+  await readVisibility(queue, state, now + 5 * 60000, io);
+  assert.equal(videoReads, 3, 'cached private monitors made extra API calls');
+  await readVisibility(queue, state, now + 15 * 60000, io);
+  assert.equal(videoReads, 6);
+  assert.ok(Object.values(state).every(r => !r.published && !r.submitted));
+});
+
+await test('a due clip ignores cached privacy and detects manual publication without a second PUT', async () => {
+  publicVids = new Set(['dueCached']);
+  const queue = { dueCached: { campaign: CAMP, at: '2026-10-01 12:00', channel: 'UCx' } };
+  const state = { dueCached: { campaign: CAMP, visibility: { privacy_status: 'private', checked_at: new Date(now - 60000).toISOString() } } };
+  videoReads = 0;
+  assert.deepEqual((await run(queue, state)).calls, ['submit dueCached']);
+  assert.equal(videoReads, 1);
+  publicVids = new Set();
+});
+
+await test('quota exhaustion stops remaining batch reads and holds every due clip private', async () => {
+  const queue = { quotaA: { campaign: CAMP, at: '2026-10-01 12:00', channel: 'UCx' },
+    quotaB: { campaign: CAMP, at: '2026-10-01 12:00', channel: 'UCx2' } };
+  quotaFailed = true; videoReads = 0;
+  try {
+    const r = await run(queue, {});
+    assert.deepEqual(r.calls, []); assert.equal(videoReads, 1);
+    assert.match(r.fatal.join(), /quotaExceeded/);
+  } finally { quotaFailed = false; }
+});
+
+await test('a missing video in a successful batch is held, never treated as private and published', async () => {
+  missingVideos = new Set(['missingBatch']);
+  try {
+    const r = await run({ missingBatch: { campaign: CAMP, at: '2026-10-01 12:00', channel: 'UCx' } }, {});
+    assert.deepEqual(r.calls, []); assert.match(r.fatal.join(), /not found/);
+  } finally { missingVideos = new Set(); }
+});
+
+await test('visibility batches stay separated by channel and dry runs do not persist cached status', async () => {
+  videoReads = 0;
+  const queue = { chA: { campaign: CAMP, at: '2026-10-02 12:00', channel: 'UCx' },
+    chB: { campaign: CAMP, at: '2026-10-02 12:00', channel: 'UCx2' } }, state = {};
+  await readVisibility(queue, state, now, { dry: true, log() {}, save() { throw new Error('dry run wrote'); } });
+  assert.equal(videoReads, 2); assert.deepEqual(state, {});
+});
+
 await test('channel feed discovers an unregistered public upload without guessing its campaign or submitting', async () => {
   feedXml = `<feed><entry><yt:videoId>externalNew</yt:videoId><published>${new Date(now - 60000).toISOString()}</published></entry></feed>`;
   const state = {}, queue = { known: { campaign: CAMP, channel: 'UCx' } }, io = { fatal: [], log() {}, save() {} };
@@ -94,7 +152,7 @@ await test('monitor entries can never publish or submit; an early public clip ra
   const queue = { watch: { campaign: CAMP, at: '2026-10-01 13:00', source_channel: 'UCx', mode: 'monitor' } }, state = {};
   assert.deepEqual((await run(queue, state)).calls, []);
   publicVids = new Set(['watch']);
-  const r = await run(queue, state);
+  const r = await run(queue, state, now + 15 * 60000);
   assert.deepEqual(r.calls, []); assert.equal(r.fatal.length, 1); assert.ok(state.watch.coverage_alert);
   assert.equal((await run(queue, state)).fatal.length, 0);
   publicVids = new Set();
@@ -129,7 +187,8 @@ await test('not due: a held clip before its slot is left alone', async () => {
   const state = {};
   const r = await run({ later: { campaign: CAMP, at: '2026-10-01 12:30', channel: 'UCx' } }, state);
   assert.deepEqual(r.calls, []);
-  assert.deepEqual(state, {});
+  assert.equal(state.later.visibility.privacy_status, 'private');
+  assert.ok(!state.later.published && !state.later.submitted);
 });
 
 await test('Podcast channel honors six-hour gaps and three daily posts across campaigns', async () => {

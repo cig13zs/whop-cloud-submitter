@@ -76,14 +76,60 @@ async function ytToken(channel) {
   return (access[channel] = d.access_token);
 }
 
-async function videoStatus(vid, channel) {
-  const r = await fetch(`${YT}videos?part=status,snippet&id=${encodeURIComponent(vid)}`, { headers: { authorization: `Bearer ${await ytToken(channel)}` } });
+export async function videoStatuses(ids, channel) {
+  const r = await fetch(`${YT}videos?part=status,snippet&id=${encodeURIComponent(ids.join(','))}`, { headers: { authorization: `Bearer ${await ytToken(channel)}` } });
   const d = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(`read ${vid}: ${r.status} ${d.error?.errors?.[0]?.reason || ''}`);
-  const status = d.items?.[0]?.status;
-  if (status?.privacyStatus === 'public' && d.items[0].snippet?.publishedAt) publicTimes[vid] = d.items[0].snippet.publishedAt;
+  if (!r.ok) throw new Error(`YouTube visibility: ${r.status} ${d.error?.errors?.[0]?.reason || ''}`);
+  if (!Array.isArray(d.items)) throw new Error('YouTube visibility: missing items');
+  for (const v of d.items) if (v.status?.privacyStatus === 'public' && v.snippet?.publishedAt) publicTimes[v.id] = v.snippet.publishedAt;
+  return d.items;
+}
+
+async function videoStatus(vid, channel) {
+  const status = (await videoStatuses([vid], channel)).find(v => v.id === vid)?.status;
   if (!status) throw new Error(`video ${vid} not found on ${channel}`);
   return status;
+}
+
+// Advisory reads may wait 15 minutes; due publication always uses fresh authenticated reads.
+export async function readVisibility(queue, state, now, io) {
+  const result = new Map(), groups = new Map();
+  let cached = 0, requests = 0, exhausted;
+  for (const [vid, q] of Object.entries(queue)) {
+    const rec = state[vid], channel = q.channel || q.source_channel;
+    if (!channel || (q.platform && q.platform !== 'youtube') || q.mode === 'api' || rec?.submitted || rec?.submission_terminal
+      || (q.mode === 'monitor' && rec?.coverage_alert)
+      || (rec?.published && now - Date.parse(rec.published) > WINDOW)) continue;
+    const advisory = q.mode === 'monitor' || now < slot(q.at);
+    const age = now - Date.parse(rec?.visibility?.checked_at || '');
+    if (advisory && age >= 0 && age < 15 * 60000 && ['private', 'unlisted'].includes(rec?.visibility?.privacy_status)) {
+      result.set(vid, { privacyStatus: rec.visibility.privacy_status }); cached++; continue;
+    }
+    if (!groups.has(channel)) groups.set(channel, []);
+    groups.get(channel).push({ vid, q, advisory });
+  }
+  for (const [channel, entries] of groups) for (let i = 0; i < entries.length; i += 50) {
+    const batch = entries.slice(i, i + 50);
+    try {
+      if (exhausted) throw exhausted;
+      requests++;
+      const rows = await net.videoStatuses(batch.map(x => x.vid), channel);
+      for (const { vid, q, advisory } of batch) {
+        const status = rows.find(v => v.id === vid)?.status;
+        if (!status) { result.set(vid, { error: new Error(`video ${vid} not found on ${channel}`) }); continue; }
+        result.set(vid, status);
+        if (advisory && ['private', 'unlisted'].includes(status.privacyStatus) && !io.dry) {
+          (state[vid] ??= { campaign: q.campaign }).visibility = { checked_at: iso(now), privacy_status: status.privacyStatus };
+        }
+      }
+    } catch (error) {
+      if (/quotaExceeded|dailyLimitExceeded/.test(error.message)) exhausted = error;
+      for (const { vid } of batch) result.set(vid, { error });
+    }
+  }
+  if (!io.dry && groups.size) io.save();
+  io.log(`YouTube visibility: ${requests} batch requests, ${cached} cached advisory reads`);
+  return result;
 }
 
 export async function publish(vid, channel) {
@@ -281,7 +327,7 @@ function igRelease(args) {
   catch (e) { throw new Error(`gh release ${args[0]} failed (exit ${e.status ?? 'timeout'})`); }
 }
 
-export const net = { feed, isPublic, cap, publish, submit, whopCheck, ig: {
+export const net = { feed, isPublic, videoStatuses, cap, publish, submit, whopCheck, ig: {
   me: () => igGet('me', 'user_id,username'),
   // Instagram Login takes Reels only by video_url: upload_type=resumable answered "The parameter video_url is
   // required" (probe run 37201477081, 2026-10-04). Meta fetches the file itself from link() below.
@@ -335,6 +381,13 @@ async function open(campaign, state, io) {
 
 export async function candidates(queue, state, now, io) {
   const out = new Map(); // vid -> [campaign, public since]
+  const visibility = await readVisibility(queue, state, now, io);
+  const visibleNow = async (vid, q) => {
+    const status = visibility.get(vid);
+    if (!status) return net.isPublic(vid, q, now);
+    if (status.error) throw status.error;
+    return status.privacyStatus === 'public';
+  };
   for (const [channel, campaign] of Object.entries(DEFAULTS)) {
     try { for (const [vid, t] of await net.feed(channel)) if (now - t <= WINDOW) out.set(vid, [campaign, t]); }
     catch (e) { io.log(`feed ${channel}: ${e.message}`); } // a feed hiccup mustn't stop the queued videos
@@ -348,11 +401,12 @@ export async function candidates(queue, state, now, io) {
   const manilaDay = t => new Date(t + 8 * 3600e3).toISOString().slice(0, 10);
   for (const [vid, r] of Object.entries(state)) if (rules[author(vid, r)] && Number.isFinite(postingTime(r))) { const ch = author(vid, r); last[ch] = Math.max(last[ch] || 0, postingTime(r)); }
   for (const [vid, q] of Object.entries(queue).sort((a, b) => a[1].at.localeCompare(b[1].at))) {
-    if (state[vid]?.submitted) { out.delete(vid); continue; }
+    if (state[vid]?.submitted || state[vid]?.submission_terminal) { out.delete(vid); continue; }
     if (q.mode === 'monitor') {
       out.delete(vid);
+      if (state[vid]?.coverage_alert) continue;
       let visible = false;
-      try { visible = await net.isPublic(vid, q, now); }
+      try { visible = await visibleNow(vid, q); }
       catch (e) { if (!state[vid]?.coverage_error) { (state[vid] ??= { campaign: q.campaign }).coverage_error = iso(now); io.save(); io.fatal.push(`monitored clip ${vid} cannot verify visibility: ${e.message}`); } }
       if (visible && !state[vid]?.coverage_alert) {
         (state[vid] ??= { campaign: q.campaign }).coverage_alert = iso(now);
@@ -367,7 +421,7 @@ export async function candidates(queue, state, now, io) {
     // A held clip can be made public manually before its slot. Detect its actual public time and submit.
     let visible = false;
     if (q.channel && !pub(vid)) {
-      try { visible = await net.isPublic(vid, q, now); }
+      try { visible = await visibleNow(vid, q); }
       catch (e) { io.log(`visibility read ${vid} failed: ${e.message}`); io.fatal.push(`${vid}: ${e.message}`); continue; }
     }
     if (q.channel && !pub(vid) && visible) {
@@ -411,7 +465,7 @@ export async function candidates(queue, state, now, io) {
       continue;
     }
     const since = pub(vid) ? Date.parse(pub(vid)) : at;
-    if (now - since >= -2 * 60e3 && now - since <= (q.platform === 'tiktok' && q.scheduled === true ? TT_WINDOW : WINDOW) && !state[vid]?.submitted && await net.isPublic(vid, q, now)) out.set(vid, [q.campaign, since]);
+    if (now - since >= -2 * 60e3 && now - since <= (q.platform === 'tiktok' && q.scheduled === true ? TT_WINDOW : WINDOW) && !state[vid]?.submitted && !state[vid]?.submission_terminal && await visibleNow(vid, q)) out.set(vid, [q.campaign, since]);
   }
   return out;
 }
