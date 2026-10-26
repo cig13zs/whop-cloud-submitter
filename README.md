@@ -24,9 +24,9 @@ is now public, so minutes are free and unlimited. The old private repo, with its
   - the `protect-main` ruleset (no deletion, no force-push).
 - Laptop on: `whop_watch.py` runs `run.mjs` locally (`refresh-session.mjs --local`, saves to `laptop-state.json`) instead
   of dispatching a GitHub run. The cron covers the laptop-off hours, every 10 min, all day.
-- A clip Lorence makes public by hand before its slot is submitted on the next run.
-- `IG_TOKEN` is not set on the new repo. Lorence adds it if Instagram API posting comes back (it must belong to
-  `bloxluckclips`).
+- A clip the operator makes public by hand before its slot is submitted on the next run.
+- `IG_TOKEN` is not set on the new repo. the operator adds it if Instagram API posting comes back (it must belong to
+  `IG_USER`).
 
 ## How it works
 
@@ -75,7 +75,7 @@ no "list my account's videos" action. Test from the runner: `gh workflow run who
 The laptop's `ig_stage.py` copies Roblox MP4s to the private `ig-media` release and queues `igs:<slug>` with `mode: api`, `campaign`, Manila `at`, `asset`, `caption`, `slug`, and `yt`.
 The runner stages containers from -40 min through +6 h, then publishes at/after the slot with a working Whop session, an open campaign and a 60-minute IG gap.
 It saves the media id and permalink before submission, retries submission only inside 30 minutes, and deletes the release asset after the attempt.
-`IG_TOKEN` must belong to `bloxluckclips`; `GH_TOKEN` downloads/deletes private assets. Refresh warnings fail the run; Lorence replaces the secret himself.
+`IG_TOKEN` must belong to `IG_USER`; `GH_TOKEN` downloads/deletes private assets. Refresh warnings fail the run; the operator replaces the secret himself.
 `node run.mjs --dry-run` reads identity/quota and prints plans without creating, uploading, publishing, submitting or deleting media.
 `ig_stage.py --dry-run` plans only; `--selftest` is offline. Normal staging is once per slug, 10/day, 06:30-22:30 Manila, 60 min apart, no later than YouTube +36 h.
 Only `tools/social-post/ig_cloud.on` switches the laptop Instagram path; leave it absent until token and upload-contract checks pass.
@@ -134,7 +134,7 @@ slot is after 22:59 goes out at the 06:07 run.
 
 ## Risks
 
-- **Cookie leak.** Anyone holding `WHOP_CR_COOKIE` can act as Lorence inside Content Rewards for up to 30 days: submit clips, read submissions and earnings. It holds no password, no whop.com login and no payment method. Signing out of Whop kills it. GitHub encrypts secrets and masks them in logs; `run.mjs` never prints one.
+- **Cookie leak.** Anyone holding `WHOP_CR_COOKIE` can act as the operator inside Content Rewards for up to 30 days: submit clips, read submissions and earnings. It holds no password, no whop.com login and no payment method. Signing out of Whop kills it. GitHub encrypts secrets and masks them in logs; `run.mjs` never prints one.
 - **YouTube token leak.** A leaked `YT_REFRESH_TOKENS` could edit the queued channels' videos until it is revoked at myaccount.google.com > Security > Third-party access.
 - **Bot checks from datacenter IPs.** The app sits behind Cloudflare, with Sardine and hCaptcha on its pages. Plain `fetch` passed from the laptop; the dry run from GitHub's servers tests it from a datacenter. If a later run gets challenged, it fails before publishing anything, and GitHub emails the failure.
 - **Content Rewards changes its app.** A renamed action, or a changed body or response shape, fails the run loudly. It never fails silently.

@@ -387,7 +387,7 @@ await test('laptop fallback did it: a clip in laptop-state.json is not published
 
 await test('social: TikTok and Instagram posts are submitted with their own URL inside 30 min; TikTok waits until live', async () => {
   const TT = 'https://www.tiktok.com/@offmicmma/video/111', IG = 'https://www.instagram.com/reel/AbC-1/';
-  assert.deepEqual(socialEntry('https://www.instagram.com/bloxluckclips/reel/AbC-1/?x=1'), { key: 'ig:AbC-1', platform: 'instagram', url: IG });
+  assert.deepEqual(socialEntry('https://www.instagram.com/iguser/reel/AbC-1/?x=1'), { key: 'ig:AbC-1', platform: 'instagram', url: IG });
   assert.equal(socialEntry(TT).key, 'tt:111');
   const queue = { 'tt:111': { campaign: CAMP, at: '2026-10-01 11:50', platform: 'tiktok', url: TT, clip: 'yt1' },
                   'ig:AbC-1': { campaign: CAMP, at: '2026-10-01 11:55', platform: 'instagram', url: IG, clip: 'yt1' },
@@ -440,7 +440,7 @@ let igCalls, igStatus, igSubmit, igSession, igOpen, username, refreshed, snapsho
 function resetIG() {
   process.env.IG_TOKEN = 'offline-ig-token';
   igCalls = []; igStatus = 'FINISHED'; igSubmit = { stage: 'submitted' }; igSession = 'ok'; igOpen = true;
-  username = 'bloxluckclips'; refreshed = { access_token: process.env.IG_TOKEN, expires_in: 60 * 86400 }; snapshots = []; tmpFiles = [];
+  username = 'iguser'; refreshed = { access_token: process.env.IG_TOKEN, expires_in: 60 * 86400 }; snapshots = []; tmpFiles = [];
   net.cap = async () => igOpen ? null : 0;
   net.whopCheck = async () => { igCalls.push('whop'); return igSession; };
   net.submit = async (key, campaign, url) => {
@@ -530,12 +530,12 @@ await test('IG no token makes no calls and logs once', async () => {
 await test('IG dry run reads identity/quota, prints both plans and never mutates', async () => {
   resetIG(); const state = {}, r = await runIG(state, now, { dry: true });
   assert.deepEqual(igCalls, ['me', 'limit', 'whop']); assert.deepEqual(state, {}); assert.deepEqual(snapshots, []);
-  assert.ok(r.logs.includes('instagram api: user bloxluckclips, publishing limit 2/100'));
+  assert.ok(r.logs.includes('instagram api: user iguser, publishing limit 2/100'));
   assert.ok(r.logs.some(l => l.startsWith('would stage')) && r.logs.some(l => l.startsWith('would publish')));
 });
 await test('IG wrong account fails before upload or refresh', async () => {
-  resetIG(); username = 'someoneelse';
-  await assert.rejects(runIG(), /IG_TOKEN is for someoneelse, not bloxluckclips/);
+  resetIG(); username = 'someoneelse'; process.env.IG_USER = 'iguser';
+  await assert.rejects(runIG(), /IG_TOKEN is for someoneelse, not the configured IG_USER/);
   assert.deepEqual(igCalls, ['me']);
 });
 await test('IG token age warns from day 50 by hash, never leaking the token; a new token resets the clock', async () => {

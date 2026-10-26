@@ -9,13 +9,15 @@
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
-const AC = 'C:/Users/Lorence/Desktop/CLAUDE CODE OUTPUTS/tools/agent-chrome';
-const KEYS = 'C:/Users/Lorence/.claude/keys';
-const APP = 'https://b4e0vdqv6zgqeqj4pfgm.apps.whop.com/c/exp_zeADOv9rOOKk2x/campaigns';
+const slash = p => p.replace(/\\/g, '/');
+const AC = slash(process.env.WHOP_AC_DIR || path.join(homedir(), 'Desktop', 'CLAUDE CODE OUTPUTS', 'tools', 'agent-chrome'));
+const KEYS = slash(process.env.WHOP_KEYS_DIR || path.join(homedir(), '.claude', 'keys'));
+const APP = process.env.WHOP_APP_URL || 'https://b4e0vdqv6zgqeqj4pfgm.apps.whop.com/c/exp_zeADOv9rOOKk2x/campaigns';
 
 // --local: run run.mjs on this laptop with the same values in its env instead of pushing them to Actions secrets.
 // whop_watch.py does this while the laptop is on, so it costs no Actions minutes (dispatching ~100 cloud runs a day

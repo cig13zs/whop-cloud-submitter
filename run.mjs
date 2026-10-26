@@ -521,7 +521,8 @@ export async function igPass(queue, state, now, io) {
     .sort((a, b) => a[1].at.localeCompare(b[1].at));
   if (!process.env.IG_TOKEN) { io.log(`instagram api: IG_TOKEN not set, skipping ${entries.length} entries`); return; }
   io.igUser ??= await net.ig.me();
-  if (io.igUser.username !== 'bloxluckclips') throw new Error(`IG_TOKEN is for ${redactIG(io.igUser.username)}, not bloxluckclips`);
+  const igUser = process.env.IG_USER;
+  if (igUser && io.igUser.username !== igUser) throw new Error(`IG_TOKEN is for ${redactIG(io.igUser.username)}, not the configured IG_USER`);
   const id = io.igUser.user_id;
   if (!id) throw new Error('instagram: user_id missing');
   if (io.dry) {
