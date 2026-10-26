@@ -260,7 +260,8 @@ export function reconcileReceipts(queue, state, rows) {
       || (!q && state[vid]?.campaign && state[vid].campaign !== r.campaignId)) continue;
     const rec = state[vid] ??= { campaign: r.campaignId, ...(!q ? { receipt_only: true } : {}) };
     rec.campaign ??= r.campaignId;
-    if (rec.whop_receipt?.receipt_id === r.id && rec.whop_receipt?.status === r.status && rec.whop_receipt?.review_status === r.reviewStatus && !rec.error) continue;
+    if (rec.whop_receipt?.receipt_id === r.id && rec.whop_receipt?.status === r.status && rec.whop_receipt?.review_status === r.reviewStatus
+      && rec.whop_receipt?.author_channel_id === post.authorId && !rec.error) continue;
     if (rec.error) rec.previous_error = rec.error;
     delete rec.error;
     delete rec.submission_terminal;

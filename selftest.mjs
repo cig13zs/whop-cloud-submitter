@@ -166,6 +166,9 @@ await test('actual receipts bind campaign and author, clear duplicate errors, an
   assert.equal(reconcileReceipts(q, s, [receipt]), 1);
   assert.equal(s.got.whop_receipt.receipt_id, 'r-real'); assert.equal(s.got.whop_receipt.status, 'rejected'); assert.ok(!s.got.error);
   assert.equal(reconcileReceipts(q, s, [receipt]), 0);
+  delete s.got.whop_receipt.author_channel_id;
+  assert.equal(reconcileReceipts(q, s, [receipt]), 1);
+  assert.equal(s.got.whop_receipt.author_channel_id, 'UCx');
   const external = { ...receipt, id: 'r-outside', socialMediaPost: { ...receipt.socialMediaPost, postId: 'outsideQueue', platform: 'youtube' } };
   assert.equal(reconcileReceipts(q, s, [external]), 1);
   assert.equal(s.outsideQueue.receipt_only, true);
