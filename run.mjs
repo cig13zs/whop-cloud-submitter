@@ -328,7 +328,7 @@ function igRelease(args) {
   catch (e) { throw new Error(`gh release ${args[0]} failed (exit ${e.status ?? 'timeout'})`); }
 }
 
-export const net = { feed, isPublic, videoStatuses, cap, publish, submit, whopCheck, ig: {
+export const net = { feed, isPublic, oembedPublic: vid => fetch(`https://www.youtube.com/oembed?format=json&url=https://www.youtube.com/shorts/${vid}`, { headers: { 'user-agent': UA } }).then(r => r.ok, () => false), videoStatuses, cap, publish, submit, whopCheck, ig: {
   me: () => igGet('me', 'user_id,username'),
   // Instagram Login takes Reels only by video_url: upload_type=resumable answered "The parameter video_url is
   // required" (probe run 37201477081, 2026-10-04). Meta fetches the file itself from link() below.
@@ -466,7 +466,18 @@ export async function candidates(queue, state, now, io) {
       continue;
     }
     const since = pub(vid) ? Date.parse(pub(vid)) : at;
-    if (now - since >= -2 * 60e3 && now - since <= (q.platform === 'tiktok' && q.scheduled === true ? TT_WINDOW : WINDOW) && !state[vid]?.submitted && !state[vid]?.submission_terminal && await visibleNow(vid, q)) out.set(vid, [q.campaign, since]);
+    if (now - since >= -2 * 60e3 && now - since <= (q.platform === 'tiktok' && q.scheduled === true ? TT_WINDOW : WINDOW) && !state[vid]?.submitted && !state[vid]?.submission_terminal) {
+      // One unreadable clip must not kill the pass for every other clip (TikTok/IG entries included).
+      // Data API quota out (2026-10-29: every run died for ~4 h on 403 quotaExceeded): an already-published clip
+      // falls back to the cookieless oEmbed check. Unpublished clips stay held (see the publish branch above).
+      try {
+        let vis;
+        try { vis = await visibleNow(vid, q); }
+        catch (e) { if (pub(vid) && /quotaExceeded|dailyLimitExceeded/.test(e.message)) vis = await net.oembedPublic(vid); else throw e; }
+        if (vis) out.set(vid, [q.campaign, since]);
+      }
+      catch (e) { io.log(`visibility read ${vid} failed: ${e.message}`); io.fatal.push(`${vid}: ${e.message}`); }
+    }
   }
   return out;
 }
