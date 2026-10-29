@@ -106,6 +106,9 @@ async function videoStatus(vid, channel) {
 // YouTube Data API quota resets at midnight Pacific. Once a run sees quotaExceeded, later runs the same
 // Pacific day must not wait on another 403 to decide which clips are already public.
 const YT_QUOTA = /quotaExceeded|dailyLimitExceeded|rateLimitExceeded/i;
+const YT_NO_TOKEN = /no refresh token/i;
+// Quota and a channel missing from YT_REFRESH_TOKENS both mean no Data API. oEmbed still answers public/private.
+const apiBlind = message => YT_QUOTA.test(message || '') || YT_NO_TOKEN.test(message || '');
 export function ytQuotaBlocked(state, now) {
   const at = Date.parse(state?._ytquota?.at || '');
   if (!Number.isFinite(at)) return false;
@@ -162,15 +165,18 @@ export async function readVisibility(queue, state, now, io) {
       }
     } catch (error) {
       const quota = YT_QUOTA.test(error.message || '');
+      const noToken = YT_NO_TOKEN.test(error.message || '');
       if (quota) {
         exhausted = error;
         if (!io.dry) state._ytquota = { at: iso(now) };
       }
       for (const { vid } of batch) {
-        if (!quota) { result.set(vid, { error }); continue; }
+        if (!quota && !noToken) { result.set(vid, { error }); continue; }
         const status = await oembedVisibility(vid);
-        io.log(`${vid}: ${error.message}; oEmbed public=${status.privacyStatus === 'public'}`);
-        result.set(vid, status);
+        io.log(`${vid}: ${noToken ? 'no refresh token' : error.message}; oEmbed public=${status.privacyStatus === 'public'}`);
+        // No token cannot publish either. Do not set quotaHold, or the due path will try a flip and fatal.
+        if (noToken && status.privacyStatus !== 'public') result.set(vid, { privacyStatus: 'private', via: 'oembed', noToken: true });
+        else result.set(vid, status);
       }
     }
   }
@@ -332,7 +338,12 @@ export async function discoverUnregistered(queue, state, now, io) {
       }
     } catch (e) { io.log(`upload coverage feed read failed: ${e.message}`); }
   }));
-  if (added) { io.save(); io.log(`detected ${added} public uploads outside the submission queue`); io.fatal.push('Unregistered public uploads need exact campaign/source/review records; no publish or submit permission inferred'); }
+  if (added) {
+    io.save();
+    io.log(`WARNING: detected ${added} public uploads outside the submission queue; left unregistered; continuing queued submits`);
+    // Soft: no campaign to submit under. Laptop-closed runs must still submit every queued public clip.
+    io.fatal.push('Unregistered public uploads need exact campaign/source/review records; no publish or submit permission inferred');
+  }
   return added;
 }
 
@@ -458,13 +469,19 @@ export async function candidates(queue, state, now, io) {
       try { visible = await visibleNow(vid, q); }
       catch (e) {
         io.log(`monitored clip ${vid} visibility: ${e.message}`);
-        // Quota cannot prove a monitor clip public. Do not email; the Data API rechecks after midnight Pacific.
-        if (YT_QUOTA.test(e.message || '')) { io.holds = (io.holds || 0) + 1; continue; }
+        // Quota or a missing refresh token: oEmbed is the public check. Do not fail the run.
+        if (apiBlind(e.message)) {
+          let pub = false;
+          try { pub = (!q.platform || q.platform === 'youtube') && await net.oembedPublic(vid); } catch { /* still not a run failure */ }
+          io.holds = (io.holds || 0) + 1;
+          io.log(`monitored clip ${vid}: oEmbed public=${pub}; not failing (Data API unavailable)`);
+          continue;
+        }
         if (!state[vid]?.coverage_error) { (state[vid] ??= { campaign: q.campaign }).coverage_error = iso(now); io.save(); io.fatal.push(`monitored clip ${vid} cannot verify visibility: ${e.message}`); }
       }
       if (visible && status?.via === 'oembed') {
         io.holds = (io.holds || 0) + 1;
-        io.log(`monitored clip ${vid}: oEmbed public during YouTube quota; release alert waits for the Data API`);
+        io.log(`monitored clip ${vid}: oEmbed public without the Data API; release alert waits for an authenticated read`);
         continue;
       }
       if (visible && !state[vid]?.coverage_alert) {
@@ -483,9 +500,8 @@ export async function candidates(queue, state, now, io) {
       try { visible = await visibleNow(vid, q); }
       catch (e) {
         io.log(`visibility read ${vid} failed: ${e.message}`);
-        // Quota out: expected hold, not an email. If oEmbed shows it already public, submit it;
-        // otherwise keep it private this run (never publish blind).
-        if (YT_QUOTA.test(e.message || '') && (!q.platform || q.platform === 'youtube')) {
+        // Quota or no refresh token: oEmbed decides. A still-private clip is not published blind.
+        if (apiBlind(e.message) && (!q.platform || q.platform === 'youtube')) {
           if (await net.oembedPublic(vid)) visible = true;
           else { io.holds = (io.holds || 0) + 1; continue; }
         } else { io.fatal.push(`${vid}: ${e.message}`); continue; }
@@ -501,6 +517,13 @@ export async function candidates(queue, state, now, io) {
       continue;
     }
     if (q.channel && !pub(vid) && now >= at) {
+      // When the Data API cannot flip privacy (quota dead, or this channel has no refresh token), the clip
+      // must already have publishAt from upload time. Cloud only detects public via oEmbed and submits.
+      if (visibility.get(vid)?.noToken) {
+        io.holds = (io.holds || 0) + 1;
+        io.log(`${vid}: no refresh token; oEmbed not public; holding for publishAt`);
+        continue;
+      }
       // oEmbed said not public. Still try the Data API publish: a quota latch must not leave a due clip private
       // for the rest of the day. A 403 is logged and retried next run; it is not an email.
       if (visibility.get(vid)?.quotaHold) io.log(`${vid}: oEmbed not public under YouTube quota; trying publish`);
@@ -520,7 +543,7 @@ export async function candidates(queue, state, now, io) {
       }
       let ok = false;
       try { ok = await net.publish(vid, q.channel); }
-      catch (e) { io.log(`publish ${vid} failed: ${e.message}`); if (e.fatal) io.fatal.push(e.message); }
+      catch (e) { io.log(`publish ${vid} failed: ${e.message}`); if (e.fatal && !YT_NO_TOKEN.test(e.message || '')) io.fatal.push(e.message); }
       if (ok) {
         // We flipped it public in this run. Submit now, from this pass — a lagged snippet.publishedAt must not
         // push the clip out of the 30-minute window or into the next cron.
@@ -544,7 +567,7 @@ export async function candidates(queue, state, now, io) {
         let vis;
         try { vis = await visibleNow(vid, q); }
         catch (e) {
-          if ((!q.platform || q.platform === 'youtube') && YT_QUOTA.test(e.message || '')) {
+          if ((!q.platform || q.platform === 'youtube') && apiBlind(e.message)) {
             vis = await net.oembedPublic(vid);
             io.log(`${vid}: ${e.message}; oEmbed public=${vis}`);
             if (!vis) io.holds = (io.holds || 0) + 1;
@@ -579,33 +602,35 @@ export async function plan(queue, state, now, io) {
   return todo;
 }
 
-export async function pass(queue, state, now, io) {
-  for (const [vid, campaign, since] of await plan(queue, state, now, io)) {
-    const age = Math.floor((now - since) / 60e3);
-    let res;
-    // Content Rewards refused "Unable to confirm the post's publish time" ~20 s after publish on 10-13, 10-14 and 10-16; each
-    // went in on the next cron run, 10-15 min later. Retry in this run instead so the 30-min window isn't eaten.
-    for (let i = 0; i < 3; i++) {
-      if (i) { io.log(`${vid}: publish time not visible to Content Rewards yet, retrying in 60 s`); await (io.wait || (ms => new Promise(r => setTimeout(r, ms))))(60e3); }
-      try { res = queue[vid]?.url ? await net.submit(vid, campaign, queue[vid].url) : await net.submit(vid, campaign); } catch (e) { res = { stage: 'error', error: e.message }; if (e.fatal) io.fatal.push(e.message); }
-      if (!(res.stage === 'refused' && /confirm the post's publish time/i.test(res.error))) break;
-    }
-    io.log(`${vid} -> ${campaign}: ${res.stage}${res.note ? ` (${res.note})` : ''}${res.error ? ` ${res.error}` : ''} (public ${age} min)`);
-    const rec = (state[vid] ??= { campaign });
-    if (res.stage === 'submitted') { rec.submitted = iso(Date.now()); delete rec.error; if (res.note) rec.note = res.note; if (res.receipt) rec.whop_receipt = res.receipt; }
-    else { rec.error = `${res.stage}: ${res.error || ''}`.trim(); if (['unauthorized', 'blocked'].includes(res.stage)) io.fatal.push(`${vid}: ${rec.error}`); }
-    if (res.stage === 'refused' && /within 30 minutes|past (?:that |the )?window/i.test(res.error || '')) {
-      rec.submission_terminal = 'Whop refused the posting-time window';
-      io.fatal.push(`${vid}: Whop refused the posting-time window; preserve the public video and reconcile its first-public time`);
-    }
-    // D27 (10-12) and heje3041 (10-20): a TikTok CR can't read at 30 min stayed unreadable for the whole 3-h window while
-    // oEmbed said public. Fail the run once so GitHub emails while there is still time to repost it directly.
-    if (queue[vid]?.platform === 'tiktok' && /couldn't read/i.test(res.error || '') && age >= 30 && !rec.alerted) {
-      rec.alerted = iso(Date.now());
-      io.fatal.push(`${vid}: Content Rewards still can't read this TikTok after ${age} min; repost it directly (${queue[vid].url})`);
-    }
-    io.save();
+async function submitClip(queue, state, now, io, vid, campaign, since) {
+  const age = Math.floor((now - since) / 60e3);
+  let res;
+  // One attempt. A "publish time not visible" refusal used to sleep 60s inside the run; the 5-minute
+  // loop retries it. Sleeping here stalls every other clip under volume.
+  try { res = queue[vid]?.url ? await net.submit(vid, campaign, queue[vid].url) : await net.submit(vid, campaign); }
+  catch (e) { res = { stage: 'error', error: e.message }; if (e.fatal) io.fatal.push(e.message); }
+  io.log(`${vid} -> ${campaign}: ${res.stage}${res.note ? ` (${res.note})` : ''}${res.error ? ` ${res.error}` : ''} (public ${age} min)`);
+  const rec = (state[vid] ??= { campaign });
+  if (res.stage === 'submitted') { rec.submitted = iso(Date.now()); delete rec.error; if (res.note) rec.note = res.note; if (res.receipt) rec.whop_receipt = res.receipt; }
+  else { rec.error = `${res.stage}: ${res.error || ''}`.trim(); if (['unauthorized', 'blocked'].includes(res.stage)) io.fatal.push(`${vid}: ${rec.error}`); }
+  if (res.stage === 'refused' && /within 30 minutes|past (?:that |the )?window/i.test(res.error || '')) {
+    rec.submission_terminal = 'Whop refused the posting-time window';
+    io.fatal.push(`${vid}: Whop refused the posting-time window; preserve the public video and reconcile its first-public time`);
   }
+  // D27 (10-12) and heje3041 (10-20): a TikTok CR can't read at 30 min stayed unreadable for the whole 3-h window while
+  // oEmbed said public. Fail the run once so GitHub emails while there is still time to repost it directly.
+  if (queue[vid]?.platform === 'tiktok' && /couldn't read/i.test(res.error || '') && age >= 30 && !rec.alerted) {
+    rec.alerted = iso(Date.now());
+    io.fatal.push(`${vid}: Content Rewards still can't read this TikTok after ${age} min; repost it directly (${queue[vid].url})`);
+  }
+  io.save(); // sync write of the shared state object; each clip finishes before the next resume
+}
+
+export async function pass(queue, state, now, io) {
+  const todo = await plan(queue, state, now, io);
+  // ponytail: 5-wide matches a 5-minute tick. Raise the slice if Content Rewards accepts more concurrent posts.
+  for (let i = 0; i < todo.length; i += 5)
+    await Promise.all(todo.slice(i, i + 5).map(([vid, campaign, since]) => submitClip(queue, state, now, io, vid, campaign, since)));
 }
 
 export async function igPass(queue, state, now, io) {
@@ -705,9 +730,10 @@ export async function igPass(queue, state, now, io) {
   }
 }
 
-// GitHub emails when the job exits non-zero. Quota, a clip still waiting on publishAt, and an empty TikTok
-// queue are expected. A real Content Rewards / Whop failure still exits 1.
-export const EXPECTED_FAILURE = /quotaExceeded|quota|rateLimitExceeded|publishAt|private hold|still private|not public yet|queue is empty|no tiktok/i;
+// GitHub emails when the job exits non-zero. Quota, a channel with no refresh token, a clip still waiting on
+// publishAt, an empty TikTok queue, and public uploads that are not in the queue are expected. A real
+// Content Rewards / Whop failure still exits 1.
+export const EXPECTED_FAILURE = /quotaExceeded|quota|rateLimitExceeded|publishAt|private hold|still private|not public yet|queue is empty|no tiktok|unregistered public uploads|no refresh token/i;
 export function splitFatals(fatals) {
   const soft = [], hard = [];
   for (const f of fatals) (EXPECTED_FAILURE.test(f) ? soft : hard).push(f);

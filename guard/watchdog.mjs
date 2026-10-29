@@ -21,11 +21,19 @@ export async function scan(queue, state, now, isPublic) {
     const age = (now - since) / 60e3;
     if (!Number.isFinite(age) || age < -2 || age > 180) continue;
     if (!(await isPublic(vid, q))) continue;
-    const row = { vid, campaign: q.campaign, platform: q.platform || 'youtube', url: q.url || `https://www.youtube.com/shorts/${vid}`, age_min: Math.round(age) };
+    const row = { vid, campaign: q.campaign, platform: q.platform || 'youtube', url: q.url || `https://www.youtube.com/shorts/${vid}`, age_min: Math.round(age), since: new Date(since).toISOString() };
     (age > 28 ? repost : submitNow).push(row);
     if (age > 25) misses.push(row);
   }
   return { submitNow, repost, misses };
+}
+
+// SKIP_OLD_MISSES_BEFORE=ISO drops repost-queue clips that went public before that instant so the same
+// burned ids are not emailed every 5 minutes. A miss still inside 28 minutes, or public after the cutoff, still alerts.
+export function missesToAlert(misses, skipBefore) {
+  const cut = Date.parse(skipBefore || '');
+  if (!Number.isFinite(cut)) return misses;
+  return misses.filter(m => !(m.age_min > 28 && Date.parse(m.since) < cut));
 }
 
 async function oembedPublic(vid, q) {
@@ -42,9 +50,12 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const [qf, sf, out = '.'] = process.argv.slice(2);
   const queue = JSON.parse(readFileSync(qf, 'utf8')), state = JSON.parse(readFileSync(sf, 'utf8'));
   const { submitNow, repost, misses } = await scan(queue, state, Date.now(), oembedPublic);
+  const alerting = missesToAlert(misses, process.env.SKIP_OLD_MISSES_BEFORE || '');
   mkdirSync(out, { recursive: true });
   writeFileSync(`${out}/SUBMIT-NOW.json`, JSON.stringify(submitNow, null, 1));
   writeFileSync(`${out}/REPOST-QUEUE.json`, JSON.stringify(repost, null, 1));
-  console.log(`submit-now ${submitNow.length}, repost ${repost.length}, real misses ${misses.length}`);
-  if (misses.length) { console.error('REAL MISS: ' + misses.map(m => `${m.vid} ${m.age_min}m`).join(' | ')); process.exitCode = 2; }
+  const skipped = misses.length - alerting.length;
+  if (skipped) console.log(`skipping ${skipped} old repost misses before ${process.env.SKIP_OLD_MISSES_BEFORE} (still in REPOST-QUEUE)`);
+  console.log(`submit-now ${submitNow.length}, repost ${repost.length}, real misses ${alerting.length}`);
+  if (alerting.length) { console.error('REAL MISS: ' + alerting.map(m => `${m.vid} ${m.age_min}m`).join(' | ')); process.exitCode = 2; }
 }

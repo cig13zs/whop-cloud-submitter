@@ -2,7 +2,7 @@
 // Cases: due, not-due, gap, 30-minute-expired, API-refused (YouTube and Content Rewards), duplicate, feed, cap, auth.
 import assert from 'node:assert/strict';
 import { mergeCookies, pass, slot, GAP, mergeLaptop, socialEntry, igPass, net, IG_VERSION, reconcileReceipts, discoverUnregistered, readVisibility, splitFatals } from './run.mjs';
-import { scan } from './guard/watchdog.mjs';
+import { scan, missesToAlert } from './guard/watchdog.mjs';
 import { existsSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -176,6 +176,8 @@ await test('expected quota and private holds soft-succeed; Whop, window, and unr
     'queue is empty',
     'no tiktok posts due',
     'userRateLimitExceeded',
+    'Unregistered public uploads need exact campaign/source/review records; no publish or submit permission inferred',
+    'monitored clip x cannot verify visibility: no refresh token for UCx in YT_REFRESH_TOKENS',
   ]).hard.length, 0);
   const hard = splitFatals([
     'a: YouTube visibility: 403 quotaExceeded',
@@ -186,6 +188,7 @@ await test('expected quota and private holds soft-succeed; Whop, window, and unr
   ]);
   assert.equal(hard.soft.length, 1);
   assert.equal(hard.hard.length, 4);
+  assert.equal(splitFatals(['YouTube token refresh for UCy failed: 400 invalid_grant']).hard.length, 1);
 });
 
 await test('quota oEmbed public on a monitor clip does not fail the run or submit it', async () => {
@@ -222,8 +225,42 @@ await test('channel feed discovers an unregistered public upload without guessin
   assert.equal(await discoverUnregistered(queue, state, now, io), 1);
   assert.equal(state.externalNew.source_channel, 'UCx'); assert.equal(state.externalNew.campaign, undefined);
   assert.equal(queue.externalNew, undefined); assert.equal(io.fatal.length, 1);
+  assert.equal(splitFatals(io.fatal).hard.length, 0, 'unregistered publics must not exit 1');
+  assert.equal(splitFatals(io.fatal).soft.length, 1);
   assert.equal(await discoverUnregistered(queue, state, now, io), 0);
   feedXml = '';
+});
+
+await test('unregistered publics do not block a queued public clip in the same pass', async () => {
+  publicVids = new Set(['queuedLive']);
+  const state = { externalNew: { source_channel: 'UCx', unmapped_public_at: new Date(now - 60000).toISOString(), coverage_alert: new Date(now).toISOString() } };
+  const r = await run({ queuedLive: { campaign: CAMP, at: '2026-10-01 11:50', channel: 'UCx' } }, state);
+  assert.deepEqual(r.calls, ['submit queuedLive']);
+  assert.ok(state.queuedLive.submitted);
+  assert.equal(state.externalNew.campaign, undefined);
+  assert.equal(splitFatals(['Unregistered public uploads need exact campaign/source/review records; no publish or submit permission inferred', ...r.fatal]).hard.length, 0);
+  publicVids = new Set();
+});
+
+await test('missing refresh token uses oEmbed, does not fail, and does not block a channel that has a token', async () => {
+  publicVids = new Set(['hasToken', 'tokenLive', 'tokenMon']);
+  videoReads = 0;
+  const queue = {
+    hasToken: { campaign: CAMP, at: '2026-10-01 11:40', channel: 'UCx' },
+    tokenLive: { campaign: CAMP, at: '2026-10-01 11:50', channel: 'UCmissing' },
+    tokenHold: { campaign: CAMP, at: '2026-10-01 11:55', channel: 'UCmissing' },
+    tokenMon: { campaign: CAMP, at: '2026-10-01 13:00', source_channel: 'UCmissing', mode: 'monitor' },
+  };
+  const state = {};
+  const r = await run(queue, state);
+  assert.ok(videoReads >= 1, 'the channel with a token still uses the Data API');
+  assert.deepEqual(r.calls.filter(c => c.startsWith('submit')).sort(), ['submit hasToken', 'submit tokenLive']);
+  assert.ok(!r.calls.some(c => c.startsWith('publish')));
+  assert.ok(state.hasToken.submitted && state.tokenLive.submitted);
+  assert.ok(!state.tokenHold?.published);
+  assert.ok(!state.tokenMon?.coverage_alert);
+  assert.equal(splitFatals(r.fatal).hard.length, 0, r.fatal.join(' | '));
+  publicVids = new Set();
 });
 
 await test('monitor entries can never publish or submit; an early public clip raises an alert', async () => {
@@ -413,18 +450,40 @@ await test('duplicate: current already been submitted wording clears the stale f
   crResult = {}; publicVids = new Set();
 });
 
-await test("publish time not confirmed yet: retried in the same run, then submitted", async () => {
+await test('publish time not confirmed yet: one attempt, no in-run wait, next run submits', async () => {
   const msg = "Unable to confirm the post's publish time";
-  crResult = { pt: { code: 'CONFLICT', error: msg, success: false, times: 2 }, never: { code: 'CONFLICT', error: msg, success: false } };
+  crResult = { pt: { code: 'CONFLICT', error: msg, success: false, times: 1 } };
+  const queue = { pt: { campaign: CAMP, at: '2026-10-01 11:59', channel: 'UCx' } };
   const state = {};
-  const r = await run({ pt: { campaign: CAMP, at: '2026-10-01 11:59', channel: 'UCx' } }, state);
-  assert.deepEqual(r.calls, ['publish pt', 'submit pt', 'wait', 'submit pt', 'wait', 'submit pt']);
+  const r = await run(queue, state);
+  assert.deepEqual(r.calls, ['publish pt', 'submit pt']);
+  assert.ok(!r.calls.includes('wait'));
+  assert.ok(!state.pt.submitted);
+  assert.match(state.pt.error, /refused: CONFLICT/);
+  const r2 = await run(queue, state);
+  assert.deepEqual(r2.calls, ['submit pt']);
   assert.ok(state.pt.submitted && !state.pt.error);
-  const s2 = {};
-  const r2 = await run({ never: { campaign: CAMP, at: '2026-10-01 11:59', channel: 'UCx' } }, s2);
-  assert.deepEqual(r2.calls, ['publish never', 'submit never', 'wait', 'submit never', 'wait', 'submit never']);
-  assert.match(s2.never.error, /refused: CONFLICT/);
   crResult = {};
+});
+
+await test('queued public clips submit five at a time', async () => {
+  publicVids = new Set(['s0', 's1', 's2', 's3', 's4', 's5']);
+  const queue = Object.fromEntries(['s0', 's1', 's2', 's3', 's4', 's5'].map(id => [id, { campaign: CAMP, at: '2026-10-01 11:50' }]));
+  const orig = net.submit;
+  let active = 0, max = 0;
+  net.submit = async (...args) => {
+    active++; max = Math.max(max, active);
+    try { return await orig(...args); }
+    finally { active--; }
+  };
+  try {
+    const state = {};
+    const r = await run(queue, state);
+    assert.equal(max, 5);
+    assert.deepEqual(r.calls.filter(c => c.startsWith('submit')).sort(), ['s0', 's1', 's2', 's3', 's4', 's5'].map(id => `submit ${id}`));
+    assert.ok(!r.calls.includes('wait'));
+    for (const id of Object.keys(queue)) assert.ok(state[id].submitted);
+  } finally { net.submit = orig; publicVids = new Set(); }
 });
 
 await test('feed backstop: an unqueued Charisma Tape upload public 5 min ago is submitted to Sartain', async () => {
@@ -704,6 +763,28 @@ await test('watchdog emails only a public clip still unsubmitted after 25 min', 
   assert.deepEqual(r.misses.map(x => x.vid).sort(), ['late', 'repost']);
   const quiet = await scan({ held: queue.held, mon: queue.mon }, { held: {} }, now, async () => false);
   assert.deepEqual(quiet.misses, []);
+});
+
+await test('SKIP_OLD_MISSES_BEFORE drops burned repost ids and keeps new misses', async () => {
+  const pub = new Set(['oldBurn', 'newMiss', 'stillDue']);
+  const isPublic = async vid => pub.has(vid);
+  const queue = {
+    oldBurn: { campaign: CAMP, at: '2026-10-01 09:00', channel: 'UCx' },
+    newMiss: { campaign: CAMP, at: '2026-10-01 11:20', channel: 'UCx' },
+    stillDue: { campaign: CAMP, at: '2026-10-01 11:34', channel: 'UCx' },
+  };
+  const state = {
+    oldBurn: { published: new Date(now - 162 * 60e3).toISOString() },
+    newMiss: { published: new Date(now - 40 * 60e3).toISOString() },
+    stillDue: { published: new Date(now - 26 * 60e3).toISOString() },
+  };
+  const r = await scan(queue, state, now, isPublic);
+  assert.deepEqual(r.repost.map(x => x.vid).sort(), ['newMiss', 'oldBurn']);
+  assert.ok(r.misses.some(m => m.vid === 'oldBurn'));
+  const cut = new Date(now - 60 * 60e3).toISOString();
+  assert.deepEqual(missesToAlert(r.misses, cut).map(x => x.vid).sort(), ['newMiss', 'stillDue']);
+  assert.deepEqual(missesToAlert(r.misses, '').map(x => x.vid).sort(), ['newMiss', 'oldBurn', 'stillDue']);
+  assert.deepEqual(missesToAlert(r.misses, 'not-a-date').map(x => x.vid).sort(), ['newMiss', 'oldBurn', 'stillDue']);
 });
 
 console.log(`selftest ok: ${cases} cases`);

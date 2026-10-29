@@ -1,9 +1,26 @@
 # cloud-submitter
 
 Publishes held campaign clips on YouTube at their slot and submits them to Content Rewards within 30 minutes, from
-GitHub Actions, so it keeps working after the laptop is shut down for school. It runs the same rules as
+GitHub Actions, so it keeps working after the laptop is shut down for school. Cloud Actions is the only submit path; the laptop watcher is not required.
+It runs the same rules as
 `tools/whop_watch.py`: per-channel 5-minute GAP, the 30-minute window, campaign caps, and the Charisma Tape feed
 backstop.
+
+## Laptop closed
+
+Cloud Actions submits. Nothing on the laptop has to be awake.
+
+1. Repo variable, once: `gh variable set CLOUD_ON --body true`
+   Scheduled `whop-submit` jobs are skipped until this is `true`. `workflow_dispatch`, including the loop below, runs either way.
+2. Start the loop once: `gh workflow run loop.yml`
+   `.github/workflows/loop.yml` dispatches `whop-submit` every 5 minutes for about 5h45m, then dispatches itself. A cron at minute 17 of every second hour starts it again if that chain dies. Concurrency group `whop-loop` keeps a single loop.
+3. `submit.yml` also schedules three offset 5-minute crons (`:00`, `:02`, `:04`). GitHub often delays or drops one cron; the extras are only a backstop. Overlaps queue on concurrency group `whop-submit`.
+
+YouTube Data API quota, or a channel missing from `YT_REFRESH_TOKENS`, does not fail the run. Visibility uses oEmbed, and a public clip that is already in the queue is still submitted. Those paths cannot flip a private video to public. Set `publishAt` when the clip is uploaded so YouTube publishes it; the cloud run only detects that and submits.
+
+Public uploads that are not in `queue.json` are a warning. They stay unregistered (no campaign is inferred). Queued public clips in that same run are still submitted.
+
+`SKIP_OLD_MISSES_BEFORE` (ISO timestamp, repo variable of the same name) stops the watchdog from exiting 2 for repost-queue clips that went public before that time. Newer misses still exit 2.
 
 ## Public repo, encrypted data (since 2026-10-20)
 
@@ -106,6 +123,7 @@ Run from `Whop-Clipping-Automation\cloud-submitter`:
 5. Seed the queue: `python ..\tools\whop_watch.py cloud-in`
 6. Switch on, in this order:
    - `gh variable set CLOUD_ON --body true` (the cron starts running jobs);
+   - `gh workflow run loop.yml` once, so submits continue while the laptop is closed;
    - `New-Item ..\tools\whop-cloud.on` (the laptop stops publishing and submitting; `add` goes to the repo);
    - `Enable-ScheduledTask -TaskPath '\Creator\' -TaskName 'Whop Cloud Refresh'`.
 7. After the first real slot, check that the clip is in `state.json` with `submitted` and in Content Rewards' submissions.

@@ -1,9 +1,12 @@
 name: whop-submit
 on:
   schedule:
-    # Every 5 min, all day, off the :00 mark where GitHub queues back up. A 10 min cron plus GitHub's delay was eating
-    # the Content Rewards 30-minute window. The repo is public since 2026-10-20, so Actions minutes are free.
+    # GitHub often delays or drops a single cron (observed gaps of 4-6 h). Three offset 5-minute schedules
+    # are the backstop. The laptop-closed primary is whop-loop (loop.yml), which workflow_dispatch-es this
+    # file every 5 minutes. whop-submit concurrency queues overlaps. Minutes are free on this public repo.
+    - cron: '0,5,10,15,20,25,30,35,40,45,50,55 * * * *'
     - cron: '2,7,12,17,22,27,32,37,42,47,52,57 * * * *'
+    - cron: '4,9,14,19,24,29,34,39,44,49,54,59 * * * *'
   workflow_dispatch:
     inputs:
       dry_run:
@@ -48,6 +51,9 @@ jobs:
           IG_PROBE: ${{ inputs.dry_run && inputs.ig_probe || '' }}
       - name: Real miss only (public more than 25 min and still unsubmitted)
         if: always() && !inputs.dry_run
+        env:
+          # Optional. ISO instant: repost-queue clips public before this are not emailed again. New misses still exit 2.
+          SKIP_OLD_MISSES_BEFORE: ${{ vars.SKIP_OLD_MISSES_BEFORE }}
         run: node guard/watchdog.mjs queue.json state.json guard-out
       - name: Commit state.json.enc
         if: always() && !inputs.dry_run

@@ -1,0 +1,23 @@
+name: whop-loop
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 */2 * * *'   # resurrects the loop if it ever dies
+concurrency: { group: whop-loop, cancel-in-progress: false }
+permissions: { actions: write, contents: read }
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Dispatch whop-submit every 5 min for ~5h45m, then re-dispatch self
+        env:
+          GH_TOKEN: ${{ github.token }}
+          R: ${{ github.repository }}
+        run: |
+          end=$(( $(date +%s) + 345*60 ))
+          while [ $(date +%s) -lt $end ]; do
+            gh workflow run submit.yml -R "$R" --ref main || echo "dispatch failed"
+            sleep 300
+          done
+          gh workflow run loop.yml -R "$R" --ref main
