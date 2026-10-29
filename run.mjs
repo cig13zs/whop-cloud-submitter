@@ -442,8 +442,19 @@ export async function candidates(queue, state, now, io) {
       out.delete(vid);
       if (state[vid]?.coverage_alert) continue;
       let visible = false;
+      const status = visibility.get(vid);
       try { visible = await visibleNow(vid, q); }
-      catch (e) { if (!state[vid]?.coverage_error) { (state[vid] ??= { campaign: q.campaign }).coverage_error = iso(now); io.save(); io.fatal.push(`monitored clip ${vid} cannot verify visibility: ${e.message}`); } }
+      catch (e) {
+        io.log(`monitored clip ${vid} visibility: ${e.message}`);
+        // Quota cannot prove a monitor clip public. Do not email; the Data API rechecks after midnight Pacific.
+        if (YT_QUOTA.test(e.message || '')) { io.holds = (io.holds || 0) + 1; continue; }
+        if (!state[vid]?.coverage_error) { (state[vid] ??= { campaign: q.campaign }).coverage_error = iso(now); io.save(); io.fatal.push(`monitored clip ${vid} cannot verify visibility: ${e.message}`); }
+      }
+      if (visible && status?.via === 'oembed') {
+        io.holds = (io.holds || 0) + 1;
+        io.log(`monitored clip ${vid}: oEmbed public during YouTube quota; release alert waits for the Data API`);
+        continue;
+      }
       if (visible && !state[vid]?.coverage_alert) {
         (state[vid] ??= { campaign: q.campaign }).coverage_alert = iso(now);
         io.save();
@@ -458,7 +469,15 @@ export async function candidates(queue, state, now, io) {
     let visible = false;
     if (q.channel && !pub(vid)) {
       try { visible = await visibleNow(vid, q); }
-      catch (e) { io.log(`visibility read ${vid} failed: ${e.message}`); io.fatal.push(`${vid}: ${e.message}`); continue; }
+      catch (e) {
+        io.log(`visibility read ${vid} failed: ${e.message}`);
+        // Quota out: expected hold, not an email. If oEmbed shows it already public, submit it;
+        // otherwise keep it private this run (never publish blind).
+        if (YT_QUOTA.test(e.message || '') && (!q.platform || q.platform === 'youtube')) {
+          if (await net.oembedPublic(vid)) visible = true;
+          else { io.holds = (io.holds || 0) + 1; continue; }
+        } else { io.fatal.push(`${vid}: ${e.message}`); continue; }
+      }
     }
     if (q.channel && !pub(vid) && visible) {
       const since = publicTimes[vid] ? Date.parse(publicTimes[vid]) : now;
@@ -472,7 +491,8 @@ export async function candidates(queue, state, now, io) {
     if (q.channel && !pub(vid) && now >= at) {
       // Data API cannot flip privacy while quota is dead. oEmbed already ran; a still-private clip waits for publishAt.
       if (visibility.get(vid)?.quotaHold) {
-        io.fatal.push(`${vid}: YouTube quotaExceeded; private hold until publishAt (oEmbed not public yet)`);
+        io.holds = (io.holds || 0) + 1;
+        io.log(`${vid}: YouTube quotaExceeded; private hold until publishAt (oEmbed not public yet)`);
         continue;
       }
       const rule = rules[q.channel] || {};
@@ -518,7 +538,7 @@ export async function candidates(queue, state, now, io) {
           if ((!q.platform || q.platform === 'youtube') && YT_QUOTA.test(e.message || '')) {
             vis = await net.oembedPublic(vid);
             io.log(`${vid}: ${e.message}; oEmbed public=${vis}`);
-            if (!vis) io.fatal.push(`${vid}: YouTube quotaExceeded; private hold until publishAt (oEmbed not public yet)`);
+            if (!vis) io.holds = (io.holds || 0) + 1;
           } else throw e;
         }
         if (vis) out.set(vid, [q.campaign, since]);

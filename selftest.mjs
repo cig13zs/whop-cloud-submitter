@@ -118,8 +118,7 @@ await test('quota exhaustion stops remaining batch reads and holds every due cli
   try {
     const r = await run(queue, {});
     assert.deepEqual(r.calls, []); assert.equal(videoReads, 1);
-    assert.match(r.fatal.join(), /quotaExceeded/);
-    assert.equal(splitFatals(r.fatal).hard.length, 0);
+    assert.deepEqual(r.fatal, []); // quota is an expected hold: no failure email
   } finally { quotaFailed = false; }
 });
 
@@ -136,8 +135,7 @@ await test('quota exhaustion oEmbeds a public clip and submits it in the same ru
     assert.deepEqual(r.calls, ['submit quotaLive']);
     assert.ok(state.quotaLive.submitted);
     assert.ok(!state.quotaWait?.published);
-    assert.equal(splitFatals(r.fatal).hard.length, 0);
-    assert.match(r.fatal.join('\n'), /quotaWait: YouTube quotaExceeded; private hold/);
+    assert.deepEqual(r.fatal, []);
   } finally { quotaFailed = false; publicVids = new Set(); }
 });
 
@@ -150,7 +148,7 @@ await test('known-dead quota skips the Data API and still submits an oEmbed-publ
       waitQ: { campaign: CAMP, at: '2026-10-01 12:00', channel: 'UCx' } }, state);
     assert.equal(videoReads, 0);
     assert.deepEqual(r.calls, ['submit liveQ']);
-    assert.equal(splitFatals(r.fatal).hard.length, 0);
+    assert.deepEqual(r.fatal, []);
   } finally { quotaFailed = false; publicVids = new Set(); }
 });
 
@@ -172,6 +170,18 @@ await test('expected quota and private holds soft-succeed; Whop, window, and unr
   ]);
   assert.equal(hard.soft.length, 1);
   assert.equal(hard.hard.length, 4);
+});
+
+await test('quota oEmbed public on a monitor clip does not fail the run or submit it', async () => {
+  publicVids = new Set(['watchQ']);
+  quotaFailed = true;
+  try {
+    const state = {};
+    const r = await run({ watchQ: { campaign: CAMP, at: '2026-10-01 13:00', source_channel: 'UCx', mode: 'monitor' } }, state);
+    assert.deepEqual(r.calls, []);
+    assert.deepEqual(r.fatal, []);
+    assert.ok(!state.watchQ?.coverage_alert);
+  } finally { quotaFailed = false; publicVids = new Set(); }
 });
 
 await test('a missing video in a successful batch is held, never treated as private and published', async () => {
