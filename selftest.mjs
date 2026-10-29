@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { mergeCookies, pass, slot, GAP, mergeLaptop, socialEntry, igPass, net, IG_VERSION, reconcileReceipts, discoverUnregistered, readVisibility, splitFatals } from './run.mjs';
 import { scan, missesToAlert } from './guard/watchdog.mjs';
-import { existsSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -83,11 +83,11 @@ globalThis.fetch = async (url, opt = {}) => {
   throw new Error(`unmocked ${method} ${url}`);
 };
 
-async function run(queue, state, t = now) {
+async function run(queue, state, t = now, options = {}) {
   calls.length = 0; checks = 0;
-  const io = { log: m => console.log('   ', m), fatal: [], save() {}, wait: async () => calls.push('wait') };
+  const io = { log: m => console.log('   ', m), fatal: [], save() {}, wait: async () => calls.push('wait'), reconcileFile: false, ...options };
   await pass(queue, state, t, io);
-  return { calls: [...calls], fatal: io.fatal, checks };
+  return { calls: [...calls], fatal: io.fatal, checks, reconcile: io.reconcile || [] };
 }
 let cases = 0;
 const test = async (name, fn) => { console.log(`- ${name}`); await fn(); cases++; console.log('  ok'); };
@@ -178,6 +178,7 @@ await test('expected quota and private holds soft-succeed; Whop, window, and unr
     'userRateLimitExceeded',
     'Unregistered public uploads need exact campaign/source/review records; no publish or submit permission inferred',
     'monitored clip x cannot verify visibility: no refresh token for UCx in YT_REFRESH_TOKENS',
+    'public monitored clip watch needs release checks and receipt reconciliation; never republish',
   ]).hard.length, 0);
   const hard = splitFatals([
     'a: YouTube visibility: 403 quotaExceeded',
@@ -185,9 +186,11 @@ await test('expected quota and private holds soft-succeed; Whop, window, and unr
     'v: Whop refused the posting-time window; preserve the public video and reconcile its first-public time',
     'tt:1: Content Rewards still can\'t read this TikTok after 31 min; repost it directly (https://www.tiktok.com/x)',
     'v: unauthorized: NOT_AUTHORIZED Authentication required',
+    'receipt reconciliation unavailable; holding new publications',
+    'igs:one: publish outcome needs reconciliation; container c1; refusing another publish',
   ]);
   assert.equal(hard.soft.length, 1);
-  assert.equal(hard.hard.length, 4);
+  assert.equal(hard.hard.length, 6);
   assert.equal(splitFatals(['YouTube token refresh for UCy failed: 400 invalid_grant']).hard.length, 1);
 });
 
@@ -269,8 +272,49 @@ await test('monitor entries can never publish or submit; an early public clip ra
   publicVids = new Set(['watch']);
   const r = await run(queue, state, now + 15 * 60000);
   assert.deepEqual(r.calls, []); assert.equal(r.fatal.length, 1); assert.ok(state.watch.coverage_alert);
+  assert.equal(splitFatals(r.fatal).hard.length, 0, 'a monitor release check must not exit 1');
+  assert.equal(splitFatals(r.fatal).soft.length, 1);
   assert.equal((await run(queue, state)).fatal.length, 0);
   publicVids = new Set();
+});
+
+await test('a public monitored clip warns, is isolated, and does not block other due submits', async () => {
+  publicVids = new Set(['watch', 'dueLive']);
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'reconcile-'));
+  const file = path.join(dir, 'RECONCILE.json');
+  try {
+    const queue = {
+      dueLive: { campaign: CAMP, at: '2026-10-01 11:50', channel: 'UCx' },
+      watch: { campaign: CAMP, at: '2026-10-01 13:00', source_channel: 'UCx', mode: 'monitor' },
+    };
+    const state = {};
+    const r = await run(queue, state, now, { reconcileFile: file });
+    assert.deepEqual(r.calls.filter(c => c.startsWith('submit')), ['submit dueLive']);
+    assert.ok(!r.calls.some(c => c.startsWith('publish')), 'never republish a monitored public clip');
+    assert.ok(state.dueLive.submitted);
+    assert.ok(state.watch.coverage_alert);
+    assert.equal(state.watch.submitted, undefined);
+    assert.equal(splitFatals(r.fatal).hard.length, 0);
+    assert.match(r.fatal.join(' | '), /public monitored clip watch needs release checks and receipt reconciliation; never republish/);
+    const rows = JSON.parse(readFileSync(file, 'utf8'));
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].vid, 'watch');
+    assert.equal(rows[0].campaign, CAMP);
+    assert.equal(rows[0].action, 'never republish');
+    assert.equal(rows[0].reason, 'needs release checks and receipt reconciliation');
+    queue.dueNext = { campaign: CAMP, at: '2026-10-01 11:55', channel: 'UCx' };
+    publicVids.add('dueNext');
+    const again = await run(queue, state, now + 5 * 60000, { reconcileFile: file });
+    assert.equal(again.fatal.length, 0, 'the isolated clip must not fail the next pass');
+    assert.equal(splitFatals(again.fatal).hard.length, 0);
+    assert.deepEqual(again.calls.filter(c => c.startsWith('submit')), ['submit dueNext']);
+    assert.ok(!again.calls.some(c => c.startsWith('publish')), 'the monitored clip is never republished');
+    assert.equal(state.watch.submitted, undefined);
+    assert.ok(state.dueNext.submitted);
+  } finally {
+    publicVids = new Set();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 await test('actual receipts bind campaign and author, clear duplicate errors, and keep rejection distinct', async () => {

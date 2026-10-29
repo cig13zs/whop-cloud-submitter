@@ -438,6 +438,28 @@ async function open(campaign, state, io) {
   return io.caps[campaign];
 }
 
+// Public monitor clips are already live. Republishing would burn the clip. Isolate the id for a human and
+// keep the pass alive: this warning is soft (exit 0) so every other due clip still submits.
+function noteReconcile(io, vid, q, now) {
+  const row = {
+    vid,
+    campaign: q.campaign || null,
+    channel: q.channel || q.source_channel || null,
+    url: q.url || `https://www.youtube.com/watch?v=${vid}`,
+    detected_at: iso(now),
+    reason: 'needs release checks and receipt reconciliation',
+    action: 'never republish',
+  };
+  (io.reconcile ??= []).push(row);
+  const msg = `public monitored clip ${vid} needs release checks and receipt reconciliation; never republish`;
+  io.log(`WARNING: ${msg}`);
+  io.fatal.push(msg);
+  if (io.reconcileFile === false || io.dry) return;
+  const file = io.reconcileFile || path.join(DIR, 'RECONCILE.json');
+  try { writeFileSync(file, JSON.stringify(io.reconcile, null, 1) + '\n'); }
+  catch (e) { io.log(`RECONCILE.json write failed: ${e.message}`); }
+}
+
 export async function candidates(queue, state, now, io) {
   const out = new Map(); // vid -> [campaign, public since]
   const visibility = await readVisibility(queue, state, now, io);
@@ -487,7 +509,8 @@ export async function candidates(queue, state, now, io) {
       if (visible && !state[vid]?.coverage_alert) {
         (state[vid] ??= { campaign: q.campaign }).coverage_alert = iso(now);
         io.save();
-        io.fatal.push(`public monitored clip ${vid} needs release checks and receipt reconciliation; never republish`);
+        // One public monitor clip needs a human. Skip it, never republish, and let the rest of the pass submit.
+        noteReconcile(io, vid, q, now);
       }
       continue;
     }
@@ -731,9 +754,10 @@ export async function igPass(queue, state, now, io) {
 }
 
 // GitHub emails when the job exits non-zero. Quota, a channel with no refresh token, a clip still waiting on
-// publishAt, an empty TikTok queue, and public uploads that are not in the queue are expected. A real
-// Content Rewards / Whop failure still exits 1.
-export const EXPECTED_FAILURE = /quotaExceeded|quota|rateLimitExceeded|publishAt|private hold|still private|not public yet|queue is empty|no tiktok|unregistered public uploads|no refresh token/i;
+// publishAt, an empty TikTok queue, public uploads that are not in the queue, and one monitored public clip
+// that needs a human release check are expected. A real Content Rewards / Whop failure still exits 1.
+// The monitor phrase must not match "receipt reconciliation unavailable" or "publish outcome needs reconciliation".
+export const EXPECTED_FAILURE = /quotaExceeded|quota|rateLimitExceeded|publishAt|private hold|still private|not public yet|queue is empty|no tiktok|unregistered public uploads|no refresh token|needs release checks and receipt reconciliation|never republish/i;
 export function splitFatals(fatals) {
   const soft = [], hard = [];
   for (const f of fatals) (EXPECTED_FAILURE.test(f) ? soft : hard).push(f);

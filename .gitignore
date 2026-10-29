@@ -6,7 +6,8 @@ queue.json
 state.json
 laptop-state.json
 _archive/
-# watchdog lists (clip ids). The job logs a masked REAL MISS line; these files stay off the public repo.
+# clip-id lists. The job logs a masked warning or REAL MISS line; these files stay off the public repo.
 SUBMIT-NOW.json
 REPOST-QUEUE.json
+RECONCILE.json
 guard-out/
