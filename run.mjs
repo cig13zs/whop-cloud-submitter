@@ -91,7 +91,22 @@ async function videoStatus(vid, channel) {
   return status;
 }
 
+// YouTube Data API quota resets at midnight Pacific. Once a run sees quotaExceeded, later runs the same
+// Pacific day must not wait on another 403 to decide which clips are already public.
+const YT_QUOTA = /quotaExceeded|dailyLimitExceeded|rateLimitExceeded/i;
+export function ytQuotaBlocked(state, now) {
+  const at = Date.parse(state?._ytquota?.at || '');
+  if (!Number.isFinite(at)) return false;
+  const day = t => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Los_Angeles' }).format(t);
+  return day(at) === day(now);
+}
+async function oembedVisibility(vid) {
+  const pub = await net.oembedPublic(vid);
+  return pub ? { privacyStatus: 'public', via: 'oembed' } : { privacyStatus: 'private', via: 'oembed', quotaHold: true };
+}
+
 // Advisory reads may wait 15 minutes; due publication always uses fresh authenticated reads.
+// A dead quota does not: oEmbed answers without the Data API, and a public clip is submitted in this same run.
 export async function readVisibility(queue, state, now, io) {
   const result = new Map(), groups = new Map();
   let cached = 0, requests = 0, exhausted;
@@ -108,6 +123,17 @@ export async function readVisibility(queue, state, now, io) {
     if (!groups.has(channel)) groups.set(channel, []);
     groups.get(channel).push({ vid, q, advisory });
   }
+  if (ytQuotaBlocked(state, now)) {
+    let n = 0;
+    for (const entries of groups.values()) for (const { vid } of entries) {
+      const status = await oembedVisibility(vid);
+      io.log(`${vid}: YouTube quota exhausted; oEmbed public=${status.privacyStatus === 'public'}`);
+      result.set(vid, status);
+      n++;
+    }
+    io.log(`YouTube visibility: 0 batch requests, ${cached} cached advisory reads, ${n} oEmbed (quota exhausted ${state._ytquota.at})`);
+    return result;
+  }
   for (const [channel, entries] of groups) for (let i = 0; i < entries.length; i += 50) {
     const batch = entries.slice(i, i + 50);
     try {
@@ -123,8 +149,17 @@ export async function readVisibility(queue, state, now, io) {
         }
       }
     } catch (error) {
-      if (/quotaExceeded|dailyLimitExceeded/.test(error.message)) exhausted = error;
-      for (const { vid } of batch) result.set(vid, { error });
+      const quota = YT_QUOTA.test(error.message || '');
+      if (quota) {
+        exhausted = error;
+        if (!io.dry) state._ytquota = { at: iso(now) };
+      }
+      for (const { vid } of batch) {
+        if (!quota) { result.set(vid, { error }); continue; }
+        const status = await oembedVisibility(vid);
+        io.log(`${vid}: ${error.message}; oEmbed public=${status.privacyStatus === 'public'}`);
+        result.set(vid, status);
+      }
     }
   }
   if (!io.dry && groups.size) io.save();
@@ -435,6 +470,11 @@ export async function candidates(queue, state, now, io) {
       continue;
     }
     if (q.channel && !pub(vid) && now >= at) {
+      // Data API cannot flip privacy while quota is dead. oEmbed already ran; a still-private clip waits for publishAt.
+      if (visibility.get(vid)?.quotaHold) {
+        io.fatal.push(`${vid}: YouTube quotaExceeded; private hold until publishAt (oEmbed not public yet)`);
+        continue;
+      }
       const rule = rules[q.channel] || {};
       const gap = rule.min_gap_minutes ? rule.min_gap_minutes * 60000 : GAP;
       if (last[q.channel] && now - last[q.channel] < gap) continue;
@@ -453,27 +493,34 @@ export async function candidates(queue, state, now, io) {
       try { ok = await net.publish(vid, q.channel); }
       catch (e) { io.log(`publish ${vid} failed: ${e.message}`); if (e.fatal) io.fatal.push(e.message); }
       if (ok) {
-        const since = publicTimes[vid] ? Date.parse(publicTimes[vid]) : now;
+        // We flipped it public in this run. Submit now, from this pass — a lagged snippet.publishedAt must not
+        // push the clip out of the 30-minute window or into the next cron.
+        const since = now;
         last[q.channel] = since;
         const rec = state[vid] ??= { campaign: q.campaign };
         rec.published = iso(since);
         rec.released_at = iso(now);
         io.save(); // before the submit, so a crash can't lead to a second publish with a fresh window
         io.log(`published ${vid} (slot ${q.at})`);
-        if (now - since <= WINDOW) out.set(vid, [q.campaign, since]);
-        else { rec.submission_terminal = 'YouTube first-public timestamp predates the submission window'; io.save(); io.fatal.push(`${vid}: first-public timestamp already outside the submission window; never reupload`); }
+        out.set(vid, [q.campaign, since]);
       }
       continue;
     }
     const since = pub(vid) ? Date.parse(pub(vid)) : at;
     if (now - since >= -2 * 60e3 && now - since <= (q.platform === 'tiktok' && q.scheduled === true ? TT_WINDOW : WINDOW) && !state[vid]?.submitted && !state[vid]?.submission_terminal) {
       // One unreadable clip must not kill the pass for every other clip (TikTok/IG entries included).
-      // Data API quota out (2026-10-29: every run died for ~4 h on 403 quotaExceeded): an already-published clip
-      // falls back to the cookieless oEmbed check. Unpublished clips stay held (see the publish branch above).
+      // Quota misses are normally oEmbed'd in readVisibility. This covers a clip that never entered that batch:
+      // any YouTube clip, not only ones we already marked published, so a Studio publishAt can still be submitted.
       try {
         let vis;
         try { vis = await visibleNow(vid, q); }
-        catch (e) { if (pub(vid) && /quotaExceeded|dailyLimitExceeded/.test(e.message)) vis = await net.oembedPublic(vid); else throw e; }
+        catch (e) {
+          if ((!q.platform || q.platform === 'youtube') && YT_QUOTA.test(e.message || '')) {
+            vis = await net.oembedPublic(vid);
+            io.log(`${vid}: ${e.message}; oEmbed public=${vis}`);
+            if (!vis) io.fatal.push(`${vid}: YouTube quotaExceeded; private hold until publishAt (oEmbed not public yet)`);
+          } else throw e;
+        }
         if (vis) out.set(vid, [q.campaign, since]);
       }
       catch (e) { io.log(`visibility read ${vid} failed: ${e.message}`); io.fatal.push(`${vid}: ${e.message}`); }
@@ -624,6 +671,15 @@ export async function igPass(queue, state, now, io) {
   }
 }
 
+// GitHub emails when the job exits non-zero. Quota, a clip still waiting on publishAt, and an empty TikTok
+// queue are expected. A real Content Rewards / Whop failure still exits 1.
+export const EXPECTED_FAILURE = /quotaExceeded|quota|rateLimitExceeded|publishAt|private hold|still private|not public yet|queue is empty|no tiktok/i;
+export function splitFatals(fatals) {
+  const soft = [], hard = [];
+  for (const f of fatals) (EXPECTED_FAILURE.test(f) ? soft : hard).push(f);
+  return { soft, hard };
+}
+
 const load = f => JSON.parse(readFileSync(path.join(DIR, f), 'utf8'));
 
 // laptop-state.json: clips the laptop published/submitted itself when a cloud run failed (whop_watch.py fallback).
@@ -691,7 +747,9 @@ async function main() {
   else try { await igPass(queue, state, Date.now(), io); }
   catch (e) { io.fatal.push(redactIG(e.message)); }
   await pass(queue, state, Date.now(), io);
-  if (io.fatal.length) { console.error(`FAILED: ${io.fatal.join(' | ')}`); process.exitCode = 1; } // failed run -> GitHub emails
+  const { soft, hard } = splitFatals(io.fatal);
+  if (soft.length) console.log(`::warning::SOFT (expected, no failure): ${soft.join(' | ')}`);
+  if (hard.length) { console.error(`FAILED: ${hard.join(' | ')}`); process.exitCode = 1; } // real failure -> GitHub emails
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main().catch(e => { console.error(e.message); process.exitCode = 1; });

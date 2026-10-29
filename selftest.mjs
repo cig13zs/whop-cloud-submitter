@@ -1,7 +1,7 @@
 // Offline selftest for run.mjs: every HTTP call goes to a fake fetch, so the real request/parse code runs.
 // Cases: due, not-due, gap, 30-minute-expired, API-refused (YouTube and Content Rewards), duplicate, feed, cap, auth.
 import assert from 'node:assert/strict';
-import { mergeCookies, pass, slot, GAP, mergeLaptop, socialEntry, igPass, net, IG_VERSION, reconcileReceipts, discoverUnregistered, readVisibility } from './run.mjs';
+import { mergeCookies, pass, slot, GAP, mergeLaptop, socialEntry, igPass, net, IG_VERSION, reconcileReceipts, discoverUnregistered, readVisibility, splitFatals } from './run.mjs';
 import { existsSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -119,7 +119,59 @@ await test('quota exhaustion stops remaining batch reads and holds every due cli
     const r = await run(queue, {});
     assert.deepEqual(r.calls, []); assert.equal(videoReads, 1);
     assert.match(r.fatal.join(), /quotaExceeded/);
+    assert.equal(splitFatals(r.fatal).hard.length, 0);
   } finally { quotaFailed = false; }
+});
+
+await test('quota exhaustion oEmbeds a public clip and submits it in the same run without publishing', async () => {
+  publicVids = new Set(['quotaLive']);
+  quotaFailed = true; videoReads = 0;
+  try {
+    const state = {};
+    const r = await run({
+      quotaLive: { campaign: CAMP, at: '2026-10-01 11:50', channel: 'UCx' },
+      quotaWait: { campaign: CAMP, at: '2026-10-01 12:00', channel: 'UCx' },
+    }, state);
+    assert.equal(videoReads, 1);
+    assert.deepEqual(r.calls, ['submit quotaLive']);
+    assert.ok(state.quotaLive.submitted);
+    assert.ok(!state.quotaWait?.published);
+    assert.equal(splitFatals(r.fatal).hard.length, 0);
+    assert.match(r.fatal.join('\n'), /quotaWait: YouTube quotaExceeded; private hold/);
+  } finally { quotaFailed = false; publicVids = new Set(); }
+});
+
+await test('known-dead quota skips the Data API and still submits an oEmbed-public clip', async () => {
+  publicVids = new Set(['liveQ']);
+  quotaFailed = true; videoReads = 0;
+  try {
+    const state = { _ytquota: { at: new Date(now).toISOString() } };
+    const r = await run({ liveQ: { campaign: CAMP, at: '2026-10-01 11:50', channel: 'UCx' },
+      waitQ: { campaign: CAMP, at: '2026-10-01 12:00', channel: 'UCx' } }, state);
+    assert.equal(videoReads, 0);
+    assert.deepEqual(r.calls, ['submit liveQ']);
+    assert.equal(splitFatals(r.fatal).hard.length, 0);
+  } finally { quotaFailed = false; publicVids = new Set(); }
+});
+
+await test('expected quota and private holds soft-succeed; Whop, window, and unreadable TikTok still fail', async () => {
+  assert.equal(splitFatals([
+    'a: YouTube visibility: 403 quotaExceeded',
+    'b: YouTube quotaExceeded; private hold until publishAt (oEmbed not public yet)',
+    'still private',
+    'queue is empty',
+    'no tiktok posts due',
+    'userRateLimitExceeded',
+  ]).hard.length, 0);
+  const hard = splitFatals([
+    'a: YouTube visibility: 403 quotaExceeded',
+    'whop session: HTTP 401 NOT_AUTHORIZED; nothing published',
+    'v: Whop refused the posting-time window; preserve the public video and reconcile its first-public time',
+    'tt:1: Content Rewards still can\'t read this TikTok after 31 min; repost it directly (https://www.tiktok.com/x)',
+    'v: unauthorized: NOT_AUTHORIZED Authentication required',
+  ]);
+  assert.equal(hard.soft.length, 1);
+  assert.equal(hard.hard.length, 4);
 });
 
 await test('a missing video in a successful batch is held, never treated as private and published', async () => {
