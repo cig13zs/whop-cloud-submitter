@@ -75,17 +75,29 @@ export async function oembedPublic(vid) {
 
 const access = {};
 const publicTimes = {};
+// A revoked refresh token is invalid_grant (HTTP 400). Do not treat that as a blip.
+const YT_AUTH_ERROR = /invalid_grant|invalid_client|unauthorized_client|access_denied|invalid_token|deleted_client/;
 async function ytToken(channel) {
   if (access[channel]) return access[channel];
   const client = JSON.parse(process.env.YT_CLIENT || '{}');
   const refresh = JSON.parse(process.env.YT_REFRESH_TOKENS || '{}')[channel];
   if (!refresh) throw Object.assign(new Error(`no refresh token for ${channel} in YT_REFRESH_TOKENS (run refresh-session.mjs --yt)`), { fatal: true });
-  const r = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ client_id: client.client_id, client_secret: client.client_secret, refresh_token: refresh, grant_type: 'refresh_token' }) });
-  const d = await r.json().catch(() => ({}));
-  // d.error is a code such as invalid_grant: a Testing-mode OAuth app's refresh tokens lapse about 7 days after consent.
-  if (!r.ok || !d.access_token) throw Object.assign(new Error(`YouTube token refresh for ${channel} failed: ${r.status} ${d.error || ''}`), { fatal: true });
-  return (access[channel] = d.access_token);
+  let failure;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const r = await fetch('https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ client_id: client.client_id, client_secret: client.client_secret, refresh_token: refresh, grant_type: 'refresh_token' }) });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok && d.access_token) return (access[channel] = d.access_token);
+    // d.error is a code such as invalid_grant: a Testing-mode OAuth app's refresh tokens lapse about 7 days after consent.
+    // Google 500 internal_failure (run 40889087003) is transient. Retry once, then warn and keep the rest of the pass going.
+    const code = typeof d.error === 'string' ? d.error : '';
+    const transient = r.status >= 500 && r.status <= 599 && !YT_AUTH_ERROR.test(code);
+    const message = `YouTube token refresh for ${channel} failed: ${r.status} ${code}`.trim();
+    failure = Object.assign(new Error(transient ? `${message} (transient google 5xx)` : message), { fatal: true });
+    if (!transient || attempt === 1) break;
+    console.log(`${new Date().toISOString().slice(0, 19)}Z YouTube token refresh for ${channel}: ${r.status} ${code}; retrying once`);
+  }
+  throw failure;
 }
 
 export async function videoStatuses(ids, channel) {
@@ -754,10 +766,11 @@ export async function igPass(queue, state, now, io) {
 }
 
 // GitHub emails when the job exits non-zero. Quota, a channel with no refresh token, a clip still waiting on
-// publishAt, an empty TikTok queue, public uploads that are not in the queue, and one monitored public clip
-// that needs a human release check are expected. A real Content Rewards / Whop failure still exits 1.
+// publishAt, an empty TikTok queue, public uploads that are not in the queue, one monitored public clip
+// that needs a human release check, and a transient Google 5xx on YouTube token refresh (after one retry)
+// are expected. A revoked refresh token (invalid_grant) and a real Content Rewards / Whop failure still exit 1.
 // The monitor phrase must not match "receipt reconciliation unavailable" or "publish outcome needs reconciliation".
-export const EXPECTED_FAILURE = /quotaExceeded|quota|rateLimitExceeded|publishAt|private hold|still private|not public yet|queue is empty|no tiktok|unregistered public uploads|no refresh token|needs release checks and receipt reconciliation|never republish/i;
+export const EXPECTED_FAILURE = /quotaExceeded|quota|rateLimitExceeded|publishAt|private hold|still private|not public yet|queue is empty|no tiktok|unregistered public uploads|no refresh token|needs release checks and receipt reconciliation|never republish|transient google 5xx/i;
 export function splitFatals(fatals) {
   const soft = [], hard = [];
   for (const f of fatals) (EXPECTED_FAILURE.test(f) ? soft : hard).push(f);

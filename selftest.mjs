@@ -13,6 +13,7 @@ const calls = [];
 let session = 'ok', checks = 0, feedXml = '', publicVids = new Set(), crResult = {}, ytPutFail = new Set(), campaignStatus = {};
 const publishedDates = new Map();
 let videoReads = 0, quotaFailed = false, missingVideos = new Set();
+const tokenCalls = {}, tokenScript = {};
 process.env.WHOP_CR_COOKIE = '__Host-cr-session=fake; __Host-cr-whop-id=fake';
 process.env.YT_CLIENT = JSON.stringify({ client_id: 'id', client_secret: 'sec' });
 process.env.YT_REFRESH_TOKENS = JSON.stringify({ UCx: 'rt-x', UCx2: 'rt-x', UCy: 'rt-y', UCpodcast: 'rt-x' });
@@ -35,6 +36,9 @@ globalThis.fetch = async (url, opt = {}) => {
   }
   if (url.includes('oauth2.googleapis.com/token')) {
     const rt = new URLSearchParams(opt.body).get('refresh_token');
+    tokenCalls[rt] = (tokenCalls[rt] || 0) + 1;
+    const step = tokenScript[rt]?.shift();
+    if (step) return step.error ? json({ error: step.error }, step.status || 500) : json({ access_token: step.access_token || 'at-x', expires_in: 3600 });
     return rt === 'rt-x' ? json({ access_token: 'at-x', expires_in: 3600 }) : json({ error: 'invalid_grant' }, 400);
   }
   if (url.includes('youtube/v3/videos') && method === 'GET') {
@@ -192,6 +196,9 @@ await test('expected quota and private holds soft-succeed; Whop, window, and unr
   assert.equal(hard.soft.length, 1);
   assert.equal(hard.hard.length, 6);
   assert.equal(splitFatals(['YouTube token refresh for UCy failed: 400 invalid_grant']).hard.length, 1);
+  assert.equal(splitFatals(['YouTube token refresh for UCy failed: 500 invalid_grant']).hard.length, 1);
+  assert.equal(splitFatals(['down: YouTube token refresh for UCdown failed: 500 internal_failure (transient google 5xx)']).hard.length, 0);
+  assert.equal(splitFatals(['down: YouTube token refresh for UCdown failed: 503 backendError (transient google 5xx)']).soft.length, 1);
 });
 
 await test('quota oEmbed public on a monitor clip does not fail the run or submit it', async () => {
@@ -421,9 +428,85 @@ await test('API refused (YouTube): publish 403 -> not published, not submitted, 
 });
 
 await test('API refused (YouTube token revoked): run fails loudly', async () => {
+  const before = tokenCalls['rt-y'] || 0;
   const r = await run({ y: { campaign: CAMP, at: '2026-10-01 11:00', channel: 'UCy' } }, {});
   assert.deepEqual(r.calls, []);
   assert.match(r.fatal.join(), /UCy failed: 400 invalid_grant/);
+  assert.doesNotMatch(r.fatal.join(), /transient google 5xx/);
+  assert.equal(tokenCalls['rt-y'], before + 1, 'a revoked token is not retried');
+  assert.equal(splitFatals(r.fatal).hard.length, 1);
+  assert.equal(splitFatals(r.fatal).soft.length, 0);
+});
+
+await test('Google 5xx on token refresh retries once, then warns and still publishes the rest of the pass', async () => {
+  const tokens = JSON.parse(process.env.YT_REFRESH_TOKENS);
+  tokens.UCdown = 'rt-down';
+  process.env.YT_REFRESH_TOKENS = JSON.stringify(tokens);
+  tokenScript['rt-down'] = [
+    { status: 500, error: 'internal_failure' },
+    { status: 500, error: 'internal_failure' },
+  ];
+  publicVids = new Set(['otherLive']);
+  try {
+    const state = {};
+    const r = await run({
+      down: { campaign: CAMP, at: '2026-10-01 11:00', channel: 'UCdown' },
+      otherDue: { campaign: CAMP, at: '2026-10-01 11:40', channel: 'UCx' },
+      otherLive: { campaign: CAMP, at: '2026-10-01 11:50', channel: 'UCx' },
+    }, state);
+    assert.equal(tokenCalls['rt-down'], 2, 'one retry then stop');
+    assert.match(r.fatal.join(), /UCdown failed: 500 internal_failure \(transient google 5xx\)/);
+    assert.equal(splitFatals(r.fatal).hard.length, 0, r.fatal.join(' | '));
+    assert.equal(splitFatals(r.fatal).soft.length, 1);
+    assert.deepEqual(r.calls.filter(c => c.startsWith('publish')), ['publish otherDue']);
+    assert.deepEqual(r.calls.filter(c => c.startsWith('submit')).sort(), ['submit otherDue', 'submit otherLive']);
+    assert.ok(state.otherDue.submitted && state.otherLive.submitted);
+    assert.ok(!state.down?.published && !state.down?.submitted);
+  } finally {
+    publicVids = new Set();
+    delete tokenScript['rt-down'];
+  }
+});
+
+await test('Google 5xx on token refresh succeeds on the one retry and the clip still publishes', async () => {
+  const tokens = JSON.parse(process.env.YT_REFRESH_TOKENS);
+  tokens.UCretry = 'rt-retry';
+  process.env.YT_REFRESH_TOKENS = JSON.stringify(tokens);
+  tokenScript['rt-retry'] = [
+    { status: 503, error: 'backendError' },
+    { access_token: 'at-retry' },
+  ];
+  try {
+    const state = {};
+    const r = await run({ flake: { campaign: CAMP, at: '2026-10-01 11:00', channel: 'UCretry' } }, state);
+    assert.equal(tokenCalls['rt-retry'], 2);
+    assert.deepEqual(r.calls, ['publish flake', 'submit flake']);
+    assert.deepEqual(r.fatal, []);
+    assert.ok(state.flake.submitted);
+  } finally { delete tokenScript['rt-retry']; }
+});
+
+await test('invalid_grant on a Google 500 is a real revoke: no retry, still a hard failure, other clips continue', async () => {
+  const tokens = JSON.parse(process.env.YT_REFRESH_TOKENS);
+  tokens.UCrevoked = 'rt-revoked';
+  process.env.YT_REFRESH_TOKENS = JSON.stringify(tokens);
+  tokenScript['rt-revoked'] = [
+    { status: 500, error: 'invalid_grant' },
+    { status: 500, error: 'invalid_grant' },
+  ];
+  publicVids = new Set();
+  try {
+    const r = await run({
+      revoked: { campaign: CAMP, at: '2026-10-01 11:00', channel: 'UCrevoked' },
+      stillDue: { campaign: CAMP, at: '2026-10-01 11:40', channel: 'UCx' },
+    }, {});
+    assert.equal(tokenCalls['rt-revoked'], 1, 'auth revoke is not retried');
+    assert.match(r.fatal.join(), /invalid_grant/);
+    assert.doesNotMatch(r.fatal.join(), /transient google 5xx/);
+    assert.equal(splitFatals(r.fatal).hard.length, 1);
+    assert.deepEqual(r.calls.filter(c => c.startsWith('publish')), ['publish stillDue']);
+    assert.ok(r.calls.includes('submit stillDue'));
+  } finally { delete tokenScript['rt-revoked']; }
 });
 
 await test('API refused (Content Rewards): refusal kept as error, not marked submitted', async () => {
