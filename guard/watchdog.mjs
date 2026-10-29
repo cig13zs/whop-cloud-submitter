@@ -4,7 +4,7 @@
 // Exit 2 ONLY on a real miss (public >25 min and not submitted). Quota never alerts.
 // Monitor and Instagram API entries are not submit candidates, so a public one is not a missed Content Rewards post.
 //   node guard/watchdog.mjs queue.json state.json [outdir]
-import { readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -29,15 +29,20 @@ export async function scan(queue, state, now, isPublic) {
 }
 
 async function oembedPublic(vid, q) {
-  const url = q.platform === 'tiktok' ? q.url : `https://www.youtube.com/shorts/${vid}`;
-  const host = q.platform === 'tiktok' ? 'https://www.tiktok.com/oembed?url=' : 'https://www.youtube.com/oembed?format=json&url=';
-  return fetch(host + encodeURIComponent(url), { headers: { 'user-agent': UA } }).then(r => r.ok, () => null);
+  if (q.platform === 'tiktok') return fetch(`https://www.tiktok.com/oembed?url=${encodeURIComponent(q.url)}`, { headers: { 'user-agent': UA } }).then(r => r.ok, () => null);
+  for (const page of [`https://www.youtube.com/watch?v=${vid}`, `https://www.youtube.com/shorts/${vid}`]) {
+    try {
+      if ((await fetch(`https://www.youtube.com/oembed?format=json&url=${encodeURIComponent(page)}`, { headers: { 'user-agent': UA } })).ok) return true;
+    } catch { /* try the other URL */ }
+  }
+  return false;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const [qf, sf, out = '.'] = process.argv.slice(2);
   const queue = JSON.parse(readFileSync(qf, 'utf8')), state = JSON.parse(readFileSync(sf, 'utf8'));
   const { submitNow, repost, misses } = await scan(queue, state, Date.now(), oembedPublic);
+  mkdirSync(out, { recursive: true });
   writeFileSync(`${out}/SUBMIT-NOW.json`, JSON.stringify(submitNow, null, 1));
   writeFileSync(`${out}/REPOST-QUEUE.json`, JSON.stringify(repost, null, 1));
   console.log(`submit-now ${submitNow.length}, repost ${repost.length}, real misses ${misses.length}`);
