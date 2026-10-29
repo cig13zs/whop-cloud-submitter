@@ -2,6 +2,7 @@
 // Cases: due, not-due, gap, 30-minute-expired, API-refused (YouTube and Content Rewards), duplicate, feed, cap, auth.
 import assert from 'node:assert/strict';
 import { mergeCookies, pass, slot, GAP, mergeLaptop, socialEntry, igPass, net, IG_VERSION, reconcileReceipts, discoverUnregistered, readVisibility, splitFatals } from './run.mjs';
+import { scan } from './guard/watchdog.mjs';
 import { existsSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -666,4 +667,31 @@ await test('IG HTTP adapters use v26 Instagram Login paths, form fields and safe
 });
 net.ig = realIG; net.submit = realSubmit; net.whopCheck = realWhop; net.cap = realCap;
 delete process.env.IG_TOKEN;
+
+await test('watchdog emails only a public clip still unsubmitted after 25 min', async () => {
+  const pub = new Set(['fresh', 'late', 'repost', 'mon']);
+  const isPublic = async vid => pub.has(vid);
+  const queue = {
+    fresh: { campaign: CAMP, at: '2026-10-01 11:50', channel: 'UCx' },
+    late: { campaign: CAMP, at: '2026-10-01 11:30', channel: 'UCx' },
+    repost: { campaign: CAMP, at: '2026-10-01 11:20', channel: 'UCx' },
+    held: { campaign: CAMP, at: '2026-10-01 11:20', channel: 'UCx' },
+    done: { campaign: CAMP, at: '2026-10-01 11:20', channel: 'UCx' },
+    mon: { campaign: CAMP, at: '2026-10-01 11:00', channel: 'UCx', mode: 'monitor' },
+    old: { campaign: CAMP, at: '2026-10-01 08:00', channel: 'UCx' },
+  };
+  const state = {
+    held: {},
+    done: { submitted: '2026-10-01T03:00:00Z' },
+    repost: { published: new Date(now - 40 * 60e3).toISOString() },
+    late: { published: new Date(now - 26 * 60e3).toISOString() },
+  };
+  const r = await scan(queue, state, now, isPublic);
+  assert.deepEqual(r.submitNow.map(x => x.vid).sort(), ['fresh', 'late']);
+  assert.deepEqual(r.repost.map(x => x.vid), ['repost']);
+  assert.deepEqual(r.misses.map(x => x.vid).sort(), ['late', 'repost']);
+  const quiet = await scan({ held: queue.held, mon: queue.mon }, { held: {} }, now, async () => false);
+  assert.deepEqual(quiet.misses, []);
+});
+
 console.log(`selftest ok: ${cases} cases`);
