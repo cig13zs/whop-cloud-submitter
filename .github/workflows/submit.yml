@@ -35,6 +35,9 @@ jobs:
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned: this runner holds the secrets
+        with:
+          # Default checkout pins github.sha. A run queued on whop-submit must seal from the branch tip.
+          ref: ${{ github.ref }}
       - name: Decrypt the queue and state
         run: node crypt.mjs open
         env:
