@@ -23,7 +23,11 @@ globalThis.fetch = async (url, opt = {}) => {
   const method = opt.method || 'GET';
   if (url.includes('/feeds/videos.xml')) return new Response(feedXml);
   if (url.includes('tiktok.com/oembed')) return new Response('{}', { status: publicVids.has('tt:' + decodeURIComponent(url).split('/video/')[1]) ? 200 : 400 });
-  if (url.includes('/oembed')) return new Response('{}', { status: publicVids.has(url.split('/shorts/')[1]) ? 200 : 401 });
+  if (url.includes('/oembed')) {
+    const page = decodeURIComponent(url.split('url=')[1] || '');
+    const id = page.split('/shorts/')[1] || page.split('v=')[1];
+    return new Response('{}', { status: publicVids.has(id) ? 200 : 401 });
+  }
   if (url.includes('/api/campaign/campaigns/')) {
     const id = url.split('/').pop();
     if (campaignStatus[id]?.broken) return json({ success: false });
@@ -118,7 +122,7 @@ await test('quota exhaustion stops remaining batch reads and holds every due cli
   quotaFailed = true; videoReads = 0;
   try {
     const r = await run(queue, {});
-    assert.deepEqual(r.calls, []); assert.equal(videoReads, 1);
+    assert.deepEqual(r.calls, []); assert.equal(videoReads, 3); // one visibility read, then one publish attempt per due clip
     assert.deepEqual(r.fatal, []); // quota is an expected hold: no failure email
   } finally { quotaFailed = false; }
 });
@@ -132,7 +136,7 @@ await test('quota exhaustion oEmbeds a public clip and submits it in the same ru
       quotaLive: { campaign: CAMP, at: '2026-10-01 11:50', channel: 'UCx' },
       quotaWait: { campaign: CAMP, at: '2026-10-01 12:00', channel: 'UCx' },
     }, state);
-    assert.equal(videoReads, 1);
+    assert.equal(videoReads, 1); // the still-private clip is inside the channel gap, so it is not published this pass
     assert.deepEqual(r.calls, ['submit quotaLive']);
     assert.ok(state.quotaLive.submitted);
     assert.ok(!state.quotaWait?.published);
@@ -147,10 +151,21 @@ await test('known-dead quota skips the Data API and still submits an oEmbed-publ
     const state = { _ytquota: { at: new Date(now).toISOString() } };
     const r = await run({ liveQ: { campaign: CAMP, at: '2026-10-01 11:50', channel: 'UCx' },
       waitQ: { campaign: CAMP, at: '2026-10-01 12:00', channel: 'UCx' } }, state);
-    assert.equal(videoReads, 0);
+    assert.equal(videoReads, 0); // visibility is oEmbed-only; the second due clip waits for the channel gap
     assert.deepEqual(r.calls, ['submit liveQ']);
     assert.deepEqual(r.fatal, []);
   } finally { quotaFailed = false; publicVids = new Set(); }
+});
+
+await test('a clip already marked published is submitted during quota even if oEmbed says private', async () => {
+  quotaFailed = true;
+  publicVids = new Set();
+  videoReads = 0;
+  try {
+    const state = { stamped: { campaign: CAMP, published: new Date(now - 5 * 60e3).toISOString() } };
+    const r = await run({ stamped: { campaign: CAMP, at: '2026-10-01 11:50', channel: 'UCx' } }, state);
+    assert.deepEqual(r.calls, ['submit stamped']);
+  } finally { quotaFailed = false; }
 });
 
 await test('expected quota and private holds soft-succeed; Whop, window, and unreadable TikTok still fail', async () => {
@@ -455,14 +470,11 @@ await test('social: TikTok and Instagram posts are submitted with their own URL 
   const queue = { 'tt:111': { campaign: CAMP, at: '2026-10-01 11:50', platform: 'tiktok', url: TT, clip: 'yt1' },
                   'ig:AbC-1': { campaign: CAMP, at: '2026-10-01 11:55', platform: 'instagram', url: IG, clip: 'yt1' },
                   'tt:222': { campaign: CAMP, at: '2026-10-01 11:20', platform: 'tiktok', url: 'https://www.tiktok.com/@offmicmma/video/222' } };
-  publicVids = new Set(['tt:222']); // 111 not live yet (scheduled), 222 live but 40 min old
+  publicVids = new Set(['tt:222']); // 222 is live but 40 min old; 111's oEmbed is blocked, which is what GitHub runners do
   const state = {};
   let r = await run(queue, state);
-  assert.deepEqual(r.calls, [`url ${IG}`, 'submit ig:AbC-1']);
-  assert.ok(state['ig:AbC-1'].submitted && !state['tt:111'] && !state['tt:222']);
-  publicVids = new Set(['tt:111', 'tt:222']);
-  r = await run(queue, state);
-  assert.deepEqual(r.calls, [`url ${TT}`, 'submit tt:111']);
+  assert.deepEqual(r.calls, [`url ${TT}`, 'submit tt:111', `url ${IG}`, 'submit ig:AbC-1']);
+  assert.ok(state['tt:111'].submitted && state['ig:AbC-1'].submitted && !state['tt:222']);
   assert.deepEqual((await run(queue, state)).calls, [], 'never submitted twice');
   publicVids = new Set(); // TikTok oEmbed blocked from the runner: a laptop-queued live post still goes in
   const live = { 'tt:333': { campaign: CAMP, at: '2026-10-01 11:58', platform: 'tiktok', url: 'https://www.tiktok.com/@offmicmma/video/333', live: true } };

@@ -51,14 +51,26 @@ export async function isPublic(vid, q = {}, now = Date.now()) { // oEmbed answer
   // TikTok's servers to publish at the slot and submit from slot + 2 min when oEmbed won't answer.
   if (q.platform === 'tiktok') {
     const ok = await fetch(`https://www.tiktok.com/oembed?url=${encodeURIComponent(q.url)}`, { headers: { 'user-agent': UA } }).then(r => r.ok, () => false);
-    return ok || (q.scheduled === true && now >= slot(q.at) + 2 * 60e3);
+    // GitHub runners get HTTP 400 from TikTok oEmbed for videos that are already live (2026-10-04).
+    // After slot + 2 min, submit anyway so a posted TikTok is not left off Content Rewards.
+    return ok || now >= slot(q.at) + 2 * 60e3;
   }
   // Instagram has no cookieless public check (oEmbed needs a Meta app token; profile/embed pages are login
   // walls from outside). Instagram entries are queued only once the laptop has seen the Reel live, so trust that.
   if (q.platform === 'instagram') return true;
   const channel = q.channel || q.source_channel;
   if (channel) return (await videoStatus(vid, channel)).privacyStatus === 'public';
-  return (await fetch(`https://www.youtube.com/oembed?format=json&url=https://www.youtube.com/shorts/${vid}`, { headers: { 'user-agent': UA } })).ok;
+  return oembedPublic(vid);
+}
+
+// Shorts and watch URLs disagree for some public videos. Either 200 means it is public.
+export async function oembedPublic(vid) {
+  for (const page of [`https://www.youtube.com/watch?v=${vid}`, `https://www.youtube.com/shorts/${vid}`]) {
+    try {
+      if ((await fetch(`https://www.youtube.com/oembed?format=json&url=${encodeURIComponent(page)}`, { headers: { 'user-agent': UA } })).ok) return true;
+    } catch { /* the other URL may still answer */ }
+  }
+  return false;
 }
 
 const access = {};
@@ -363,7 +375,7 @@ function igRelease(args) {
   catch (e) { throw new Error(`gh release ${args[0]} failed (exit ${e.status ?? 'timeout'})`); }
 }
 
-export const net = { feed, isPublic, oembedPublic: vid => fetch(`https://www.youtube.com/oembed?format=json&url=https://www.youtube.com/shorts/${vid}`, { headers: { 'user-agent': UA } }).then(r => r.ok, () => false), videoStatuses, cap, publish, submit, whopCheck, ig: {
+export const net = { feed, isPublic, oembedPublic, videoStatuses, cap, publish, submit, whopCheck, ig: {
   me: () => igGet('me', 'user_id,username'),
   // Instagram Login takes Reels only by video_url: upload_type=resumable answered "The parameter video_url is
   // required" (probe run 37201477081, 2026-10-04). Meta fetches the file itself from link() below.
@@ -489,12 +501,9 @@ export async function candidates(queue, state, now, io) {
       continue;
     }
     if (q.channel && !pub(vid) && now >= at) {
-      // Data API cannot flip privacy while quota is dead. oEmbed already ran; a still-private clip waits for publishAt.
-      if (visibility.get(vid)?.quotaHold) {
-        io.holds = (io.holds || 0) + 1;
-        io.log(`${vid}: YouTube quotaExceeded; private hold until publishAt (oEmbed not public yet)`);
-        continue;
-      }
+      // oEmbed said not public. Still try the Data API publish: a quota latch must not leave a due clip private
+      // for the rest of the day. A 403 is logged and retried next run; it is not an email.
+      if (visibility.get(vid)?.quotaHold) io.log(`${vid}: oEmbed not public under YouTube quota; trying publish`);
       const rule = rules[q.channel] || {};
       const gap = rule.min_gap_minutes ? rule.min_gap_minutes * 60000 : GAP;
       if (last[q.channel] && now - last[q.channel] < gap) continue;
@@ -541,7 +550,12 @@ export async function candidates(queue, state, now, io) {
             if (!vis) io.holds = (io.holds || 0) + 1;
           } else throw e;
         }
-        if (vis) out.set(vid, [q.campaign, since]);
+        // A publish stamp (this runner or the laptop fallback) means the clip was already made public.
+        // A false oEmbed answer must not drop it out of the 30-minute window.
+        if (vis || pub(vid)) {
+          if (!vis && pub(vid)) io.log(`${vid}: oEmbed did not confirm; submitting from recorded publish time`);
+          out.set(vid, [q.campaign, since]);
+        }
       }
       catch (e) { io.log(`visibility read ${vid} failed: ${e.message}`); io.fatal.push(`${vid}: ${e.message}`); }
     }
