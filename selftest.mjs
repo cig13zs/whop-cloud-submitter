@@ -781,10 +781,10 @@ await test('SKIP_OLD_MISSES_BEFORE drops burned repost ids and keeps new misses'
   const r = await scan(queue, state, now, isPublic);
   assert.deepEqual(r.repost.map(x => x.vid).sort(), ['newMiss', 'oldBurn']);
   assert.ok(r.misses.some(m => m.vid === 'oldBurn'));
+  assert.deepEqual(missesToAlert(r.misses, r.repost).map(x => x.vid), ['stillDue']);
   const cut = new Date(now - 60 * 60e3).toISOString();
-  assert.deepEqual(missesToAlert(r.misses, cut).map(x => x.vid).sort(), ['newMiss', 'stillDue']);
-  assert.deepEqual(missesToAlert(r.misses, '').map(x => x.vid).sort(), ['newMiss', 'oldBurn', 'stillDue']);
-  assert.deepEqual(missesToAlert(r.misses, 'not-a-date').map(x => x.vid).sort(), ['newMiss', 'oldBurn', 'stillDue']);
+  assert.deepEqual(missesToAlert(r.misses, [], cut).map(x => x.vid).sort(), ['newMiss', 'stillDue']);
+  assert.deepEqual(missesToAlert(r.misses, r.repost, 'not-a-date').map(x => x.vid), ['stillDue']);
 });
 
 console.log(`selftest ok: ${cases} cases`);

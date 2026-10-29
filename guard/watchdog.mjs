@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Quota-independent 30-min watchdog. Reads queue.json + state.json (cloud submitter format), checks public via oEmbed
 // (YouTube/TikTok, no API quota), writes SUBMIT-NOW.json (public, unsubmitted, <=28 min) and REPOST-QUEUE.json (>28 min).
-// Exit 2 ONLY on a real miss (public >25 min and not submitted). Quota never alerts.
+// Exit 2 only for a new miss still inside the submit window (public 25–28 min). Clips already in
+// REPOST-QUEUE (public >28 min) are logged and do not fail the run. Quota never alerts.
 // Monitor and Instagram API entries are not submit candidates, so a public one is not a missed Content Rewards post.
 //   node guard/watchdog.mjs queue.json state.json [outdir]
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -28,12 +29,16 @@ export async function scan(queue, state, now, isPublic) {
   return { submitNow, repost, misses };
 }
 
-// SKIP_OLD_MISSES_BEFORE=ISO drops repost-queue clips that went public before that instant so the same
-// burned ids are not emailed every 5 minutes. A miss still inside 28 minutes, or public after the cutoff, still alerts.
-export function missesToAlert(misses, skipBefore) {
+// Repost-queue rows are already-known burned ids. They must not exit 2 every 5 minutes.
+// A miss still in SUBMIT-NOW (25–28 min) still alerts. skipBefore is an extra cutoff for anything older.
+export function missesToAlert(misses, repost = [], skipBefore = '') {
+  const burned = new Set(repost.map(r => r.vid));
   const cut = Date.parse(skipBefore || '');
-  if (!Number.isFinite(cut)) return misses;
-  return misses.filter(m => !(m.age_min > 28 && Date.parse(m.since) < cut));
+  return misses.filter(m => {
+    if (burned.has(m.vid)) return false;
+    if (Number.isFinite(cut) && Date.parse(m.since) < cut) return false;
+    return true;
+  });
 }
 
 async function oembedPublic(vid, q) {
@@ -50,12 +55,11 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const [qf, sf, out = '.'] = process.argv.slice(2);
   const queue = JSON.parse(readFileSync(qf, 'utf8')), state = JSON.parse(readFileSync(sf, 'utf8'));
   const { submitNow, repost, misses } = await scan(queue, state, Date.now(), oembedPublic);
-  const alerting = missesToAlert(misses, process.env.SKIP_OLD_MISSES_BEFORE || '');
+  const alerting = missesToAlert(misses, repost, process.env.SKIP_OLD_MISSES_BEFORE || '');
   mkdirSync(out, { recursive: true });
   writeFileSync(`${out}/SUBMIT-NOW.json`, JSON.stringify(submitNow, null, 1));
   writeFileSync(`${out}/REPOST-QUEUE.json`, JSON.stringify(repost, null, 1));
-  const skipped = misses.length - alerting.length;
-  if (skipped) console.log(`skipping ${skipped} old repost misses before ${process.env.SKIP_OLD_MISSES_BEFORE} (still in REPOST-QUEUE)`);
+  if (repost.length) console.log(`repost-queue ${repost.length} already-known; not failing`);
   console.log(`submit-now ${submitNow.length}, repost ${repost.length}, real misses ${alerting.length}`);
   if (alerting.length) { console.error('REAL MISS: ' + alerting.map(m => `${m.vid} ${m.age_min}m`).join(' | ')); process.exitCode = 2; }
 }
