@@ -18,6 +18,8 @@ const DIR = path.dirname(fileURLToPath(import.meta.url));
 export const WINDOW = 30 * 60e3;   // Content Rewards takes a post only within 30 min of it going public
 // A TikTok still "Content under review" is unreadable to Content Rewards ("We couldn't read that from the platform"); D27
 // stayed unreadable for all 30 min on 2026-10-12, so Studio-scheduled TikTok entries keep retrying for 3 h.
+// Public monitor / unregistered clips are auto-submitted only inside this window (margin under WINDOW); past it they hard-fail.
+export const PUBLIC_SUBMIT_WINDOW = 28 * 60e3;
 export const TT_WINDOW = 3 * 3600e3;
 export const GAP = 5 * 60e3;       // min time between two publishes on one channel ("just uplaod everything now", 2026-09-30)
 const DEFAULTS = { UC1xCBrygVPEwmmzLxSN_zNg: '86842687-ba2b-4638-a024-995dcf3d25a3' }; // Charisma Tape -> Sartain, feed backstop
@@ -340,23 +342,27 @@ export function reconcileReceipts(queue, state, rows) {
 
 export async function discoverUnregistered(queue, state, now, io) {
   const channels = [...new Set(Object.values(queue).map(q => q.channel || q.source_channel).filter(Boolean))];
-  let added = 0;
+  let added = 0, sole = 0;
   await Promise.all(channels.map(async channel => {
     try {
       for (const [vid, at] of await net.feed(channel)) {
         if (queue[vid] || state[vid]?.submitted || state[vid]?.unmapped_public_at || now < at || now - at > 24 * 3600e3) continue;
-        state[vid] = { ...state[vid], source_channel: channel, unmapped_public_at: iso(at), coverage_alert: iso(now) };
+        // Exactly one campaign on this channel -> submit under it (see candidates). Zero or several: ambiguous, soft.
+        const campaigns = [...new Set([...Object.values(queue).filter(q => (q.channel || q.source_channel) === channel).map(q => q.campaign), DEFAULTS[channel]].filter(Boolean))];
+        state[vid] = { ...state[vid], source_channel: channel, unmapped_public_at: iso(at), coverage_alert: iso(now), ...(campaigns.length === 1 ? { campaign: campaigns[0] } : {}) };
+        if (campaigns.length === 1) { sole++; continue; }
         added++;
       }
     } catch (e) { io.log(`upload coverage feed read failed: ${e.message}`); }
   }));
+  if (sole) { io.save(); io.log(`detected ${sole} public uploads outside the queue on single-campaign channels; submitting inside ${PUBLIC_SUBMIT_WINDOW / 60e3} min, else PUBLIC-UNSUBMITTED`); }
   if (added) {
     io.save();
-    io.log(`WARNING: detected ${added} public uploads outside the submission queue; left unregistered; continuing queued submits`);
-    // Soft: no campaign to submit under. Laptop-closed runs must still submit every queued public clip.
+    io.log(`WARNING: detected ${added} public uploads outside the submission queue with an ambiguous/unknown campaign; left unregistered; continuing queued submits`);
+    // Soft: ambiguous or unknown campaign, nothing to submit under. Laptop-closed runs must still submit every queued public clip.
     io.fatal.push('Unregistered public uploads need exact campaign/source/review records; no publish or submit permission inferred');
   }
-  return added;
+  return added + sole;
 }
 
 // Content Rewards dropped listMySubmissionsAction (~10-21), which held every clip as "session dead". The session check
@@ -450,8 +456,8 @@ async function open(campaign, state, io) {
   return io.caps[campaign];
 }
 
-// Public monitor clips are already live. Republishing would burn the clip. Isolate the id for a human and
-// keep the pass alive: this warning is soft (exit 0) so every other due clip still submits.
+// A public clip with no receipt that we can no longer auto-submit (past 28 min, no campaign, or submit failed).
+// Never republish. This is a HARD failure (exit 1, GitHub email): see FOREVER-SUBMIT-RULE.md. The pass keeps going so every other due clip still submits.
 function noteReconcile(io, vid, q, now) {
   const row = {
     vid,
@@ -459,11 +465,11 @@ function noteReconcile(io, vid, q, now) {
     channel: q.channel || q.source_channel || null,
     url: q.url || `https://www.youtube.com/watch?v=${vid}`,
     detected_at: iso(now),
-    reason: 'needs release checks and receipt reconciliation',
+    reason: 'PUBLIC-UNSUBMITTED',
     action: 'never republish',
   };
   (io.reconcile ??= []).push(row);
-  const msg = `public monitored clip ${vid} needs release checks and receipt reconciliation; never republish`;
+  const msg = `PUBLIC-UNSUBMITTED ${vid}: public monitored clip is past ${PUBLIC_SUBMIT_WINDOW / 60e3} min or has no campaign; never republish`;
   io.log(`WARNING: ${msg}`);
   io.fatal.push(msg);
   if (io.reconcileFile === false || io.dry) return;
@@ -519,9 +525,20 @@ export async function candidates(queue, state, now, io) {
         continue;
       }
       if (visible && !state[vid]?.coverage_alert) {
-        (state[vid] ??= { campaign: q.campaign }).coverage_alert = iso(now);
+        const rec = state[vid] ??= { campaign: q.campaign };
+        const since = publicTimes[vid] ? Date.parse(publicTimes[vid]) : now;
+        if (q.campaign && now - since <= PUBLIC_SUBMIT_WINDOW && !rec.submission_terminal) {
+          // Already public with a campaign and still inside the window: submit it (never republish). A failed attempt
+          // is retried next run until the window closes, then hard-fails below.
+          rec.published ??= iso(since);
+          io.save();
+          io.log(`monitored clip ${vid} is public (${Math.floor((now - since) / 60e3)} min); submitting, never republishing`);
+          out.set(vid, [q.campaign, since]);
+          continue;
+        }
+        rec.coverage_alert = iso(now);
         io.save();
-        // One public monitor clip needs a human. Skip it, never republish, and let the rest of the pass submit.
+        // Past the window (or no campaign): hard fail so the miss is emailed. Never republish.
         noteReconcile(io, vid, q, now);
       }
       continue;
@@ -618,6 +635,16 @@ export async function candidates(queue, state, now, io) {
       catch (e) { io.log(`visibility read ${vid} failed: ${e.message}`); io.fatal.push(`${vid}: ${e.message}`); }
     }
   }
+  // Unregistered public uploads on a single-campaign channel (discoverUnregistered stamped state[vid].campaign).
+  for (const [vid, rec] of Object.entries(state)) {
+    if (queue[vid] || !rec.unmapped_public_at || !rec.campaign || rec.submitted || rec.submission_terminal || rec.public_unsubmitted_alert) continue;
+    const since = Date.parse(rec.unmapped_public_at);
+    if (now - since <= PUBLIC_SUBMIT_WINDOW) { io.log(`unregistered public ${vid} (${Math.floor((now - since) / 60e3)} min): submitting under its channel's only campaign`); out.set(vid, [rec.campaign, since]); continue; }
+    rec.public_unsubmitted_alert = iso(now);
+    io.save();
+    io.log(`WARNING: unregistered public ${vid} is past ${PUBLIC_SUBMIT_WINDOW / 60e3} min without a receipt`);
+    io.fatal.push(`PUBLIC-UNSUBMITTED ${vid}: unregistered public upload past ${PUBLIC_SUBMIT_WINDOW / 60e3} min without a submission receipt`);
+  }
   return out;
 }
 
@@ -648,6 +675,9 @@ async function submitClip(queue, state, now, io, vid, campaign, since) {
   const rec = (state[vid] ??= { campaign });
   if (res.stage === 'submitted') { rec.submitted = iso(Date.now()); delete rec.error; if (res.note) rec.note = res.note; if (res.receipt) rec.whop_receipt = res.receipt; }
   else { rec.error = `${res.stage}: ${res.error || ''}`.trim(); if (['unauthorized', 'blocked'].includes(res.stage)) io.fatal.push(`${vid}: ${rec.error}`); }
+  // Auto-submit of a public monitor / unregistered clip failed: hard fail (exit 1) so it is emailed while there is time.
+  if (res.stage !== 'submitted' && (queue[vid]?.mode === 'monitor' || (!queue[vid] && rec.unmapped_public_at)))
+    io.fatal.push(`PUBLIC-UNSUBMITTED ${vid}: auto-submit failed (${res.stage})`);
   if (res.stage === 'refused' && /within 30 minutes|past (?:that |the )?window/i.test(res.error || '')) {
     rec.submission_terminal = 'Whop refused the posting-time window';
     io.fatal.push(`${vid}: Whop refused the posting-time window; preserve the public video and reconcile its first-public time`);
@@ -766,14 +796,14 @@ export async function igPass(queue, state, now, io) {
 }
 
 // GitHub emails when the job exits non-zero. Quota, a channel with no refresh token, a clip still waiting on
-// publishAt, an empty TikTok queue, public uploads that are not in the queue, one monitored public clip
-// that needs a human release check, and a transient Google 5xx on YouTube token refresh (after one retry)
+// publishAt, an empty TikTok queue, public uploads with an ambiguous/unknown campaign, and a transient Google 5xx on YouTube token refresh (after one retry)
 // are expected. A revoked refresh token (invalid_grant) and a real Content Rewards / Whop failure still exit 1.
-// The monitor phrase must not match "receipt reconciliation unavailable" or "publish outcome needs reconciliation".
-export const EXPECTED_FAILURE = /quotaExceeded|quota|rateLimitExceeded|publishAt|private hold|still private|not public yet|queue is empty|no tiktok|unregistered public uploads|no refresh token|needs release checks and receipt reconciliation|never republish|transient google 5xx/i;
+// A public monitor / unregistered clip that is past 28 min or failed auto-submit is `PUBLIC-UNSUBMITTED <id>`: always exit 1.
+export const EXPECTED_FAILURE = /quotaExceeded|quota|rateLimitExceeded|publishAt|private hold|still private|not public yet|queue is empty|no tiktok|unregistered public uploads|no refresh token|transient google 5xx/i;
 export function splitFatals(fatals) {
   const soft = [], hard = [];
-  for (const f of fatals) (EXPECTED_FAILURE.test(f) ? soft : hard).push(f);
+  // PUBLIC-UNSUBMITTED is always hard, even if its text mentions an expected phrase.
+  for (const f of fatals) (!/^PUBLIC-UNSUBMITTED\b/.test(f) && EXPECTED_FAILURE.test(f) ? soft : hard).push(f);
   return { soft, hard };
 }
 
