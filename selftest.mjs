@@ -258,6 +258,41 @@ await test('unregistered public on a single-campaign channel is submitted inside
   feedXml = ''; publicVids = new Set();
 });
 
+await test('unregistered public with a CR receipt under any campaign/author counts submitted (receipt_mismatch), no fatal', async () => {
+  const old = { mism: { source_channel: 'UCx', campaign: CAMP, unmapped_public_at: new Date(now - 40 * 60000).toISOString() } };
+  const rec = { id: 'r-other', campaignId: 'other', createdAt: '2026-10-01T03:58:00Z', status: 'pending', reviewStatus: 'pending', socialMediaPost: { postId: 'mism', authorId: 'someoneElse' } };
+  const r = await run({}, old, now, { receiptByVid: new Map([['mism', rec]]) });
+  assert.deepEqual(r.fatal, []); assert.ok(!r.calls.includes('submit mism'));
+  assert.ok(old.mism.submitted); assert.equal(old.mism.receipt_mismatch.receipt_id, 'r-other'); assert.equal(old.mism.receipt_mismatch.campaign_id, 'other');
+});
+
+await test('unregistered public past 28 min on a PAUSED/capped campaign is a soft warning; on a live campaign it still hard-fails', async () => {
+  campaignStatus = { pausedC: { status: 'paused' }, cappedC: { cap: 1 } };
+  const mk = c => ({ deadVid: { source_channel: 'UCx', campaign: c, unmapped_public_at: new Date(now - 40 * 60000).toISOString() } });
+  for (const c of ['pausedC', 'cappedC']) {
+    const st = mk(c); if (c === 'cappedC') st.prev = { campaign: c, submitted: '2026-10-01T00:00:00Z' };
+    const r = await run({}, st);
+    assert.equal(splitFatals(r.fatal).hard.length, 0, c); assert.equal(splitFatals(r.fatal).soft.length, 1, c);
+    assert.match(r.fatal.join(' '), /dead campaign/); assert.ok(!r.fatal.join(' ').includes('deadVid'), 'no raw id in log');
+    assert.ok(st.deadVid.public_unsubmitted_alert); assert.ok(!r.calls.includes('submit deadVid'));
+  }
+  const live = await run({}, mk(CAMP));
+  assert.equal(splitFatals(live.fatal).hard.length, 1); assert.match(live.fatal.join(' '), /PUBLIC-UNSUBMITTED deadVid/);
+  campaignStatus = { brokenC: { broken: true } };
+  assert.equal(splitFatals((await run({}, mk('brokenC'))).fatal).hard.length, 1, 'failed lookup is not dead');
+  campaignStatus = {};
+});
+
+await test('public monitor clip past 28 min on a paused campaign is soft; reconcile row still recorded', async () => {
+  campaignStatus = { pausedM: { status: 'paused' } };
+  publishedDates.set('monDead', now - 40 * 60000); publicVids = new Set(['monDead']);
+  try {
+    const r = await run({ monDead: { campaign: 'pausedM', at: '2026-10-01 11:00', source_channel: 'UCx', mode: 'monitor' } }, {});
+    assert.equal(splitFatals(r.fatal).hard.length, 0); assert.equal(splitFatals(r.fatal).soft.length, 1);
+    assert.equal(r.reconcile[0].reason, 'PUBLIC-UNSUBMITTED-DEAD-CAMPAIGN'); assert.deepEqual(r.calls, []);
+  } finally { publishedDates.delete('monDead'); publicVids = new Set(); campaignStatus = {}; }
+});
+
 await test('unregistered publics do not block a queued public clip in the same pass', async () => {
   publicVids = new Set(['queuedLive']);
   const state = { externalNew: { source_channel: 'UCx', unmapped_public_at: new Date(now - 60000).toISOString(), coverage_alert: new Date(now).toISOString() } };

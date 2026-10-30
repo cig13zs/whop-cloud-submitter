@@ -20,6 +20,10 @@ export const WINDOW = 30 * 60e3;   // Content Rewards takes a post only within 3
 // stayed unreadable for all 30 min on 2026-10-12, so Studio-scheduled TikTok entries keep retrying for 3 h.
 // Public monitor / unregistered clips are auto-submitted only inside this window (margin under WINDOW); past it they hard-fail.
 export const PUBLIC_SUBMIT_WINDOW = 28 * 60e3;
+// Logs are public and ids are ::add-mask::'d, so print a stable short hash next to each miss: match it locally with
+// `node -e "console.log(require('crypto').createHash('sha256').update('VIDEO_ID').digest('hex').slice(0,8))"`.
+// Full ids go to RECONCILE.json (encrypted with state), never plain in the public log.
+export const tag = vid => 'h' + createHash('sha256').update(String(vid).replace(/^\w+:/, '')).digest('hex').slice(0, 8);
 export const TT_WINDOW = 3 * 3600e3;
 export const GAP = 5 * 60e3;       // min time between two publishes on one channel ("just uplaod everything now", 2026-09-30)
 const DEFAULTS = { UC1xCBrygVPEwmmzLxSN_zNg: '86842687-ba2b-4638-a024-995dcf3d25a3' }; // Charisma Tape -> Sartain, feed backstop
@@ -456,19 +460,37 @@ async function open(campaign, state, io) {
   return io.caps[campaign];
 }
 
+// Is this campaign dead (paused / out of budget / refunded / per-user cap reached)? A public clip on a dead campaign can
+// never be submitted, so a miss there is a soft warning, not a CI failure (7 dead-campaign publics burned CI after PR #7,
+// run 41015646131). A failed lookup is NOT dead: unknown stays a hard fail. Looked up once per campaign per run.
+async function dead(campaign, state, io) {
+  if (!campaign) return false;
+  io.dead ??= {};
+  if (!(campaign in io.dead)) {
+    try {
+      const limit = await net.cap(campaign);
+      const used = (USED_BEFORE[campaign] || 0) + Object.values(state).filter(r => r.campaign === campaign && r.submitted).length;
+      io.dead[campaign] = limit === 0 || (limit != null && used >= limit);
+    } catch (e) { io.log(`dead-campaign lookup ${campaign} failed (${e.message}): treating as live`); io.dead[campaign] = false; }
+  }
+  return io.dead[campaign];
+}
+const deadWarn = (io, vid, campaign, what) => { const m = `dead campaign: ${what} ${tag(vid)} on paused/out-of-budget campaign ${campaign}; cannot be submitted (warning only)`; io.log(`WARNING: ${m}`); io.fatal.push(m); };
+
 // A public clip with no receipt that we can no longer auto-submit (past 28 min, no campaign, or submit failed).
 // Never republish. This is a HARD failure (exit 1, GitHub email): see FOREVER-SUBMIT-RULE.md. The pass keeps going so every other due clip still submits.
-function noteReconcile(io, vid, q, now) {
+function noteReconcile(io, vid, q, now, isDead = false) {
   const row = {
     vid,
     campaign: q.campaign || null,
     channel: q.channel || q.source_channel || null,
     url: q.url || `https://www.youtube.com/watch?v=${vid}`,
     detected_at: iso(now),
-    reason: 'PUBLIC-UNSUBMITTED',
+    reason: isDead ? 'PUBLIC-UNSUBMITTED-DEAD-CAMPAIGN' : 'PUBLIC-UNSUBMITTED',
     action: 'never republish',
   };
   (io.reconcile ??= []).push(row);
+  if (isDead) { deadWarn(io, vid, q.campaign, 'public monitored clip'); return; }
   const msg = `PUBLIC-UNSUBMITTED ${vid}: public monitored clip is past ${PUBLIC_SUBMIT_WINDOW / 60e3} min or has no campaign; never republish`;
   io.log(`WARNING: ${msg}`);
   io.fatal.push(msg);
@@ -539,7 +561,7 @@ export async function candidates(queue, state, now, io) {
         rec.coverage_alert = iso(now);
         io.save();
         // Past the window (or no campaign): hard fail so the miss is emailed. Never republish.
-        noteReconcile(io, vid, q, now);
+        noteReconcile(io, vid, q, now, await dead(q.campaign, state, io));
       }
       continue;
     }
@@ -639,11 +661,16 @@ export async function candidates(queue, state, now, io) {
   for (const [vid, rec] of Object.entries(state)) {
     if (queue[vid] || !rec.unmapped_public_at || !rec.campaign || rec.submitted || rec.submission_terminal || rec.public_unsubmitted_alert) continue;
     const since = Date.parse(rec.unmapped_public_at);
+    // A CR receipt for this video under ANY campaign/author (reconcileReceipts skips mismatches) counts as submitted:
+    // Pending/Approved/Rejected on CR is the truth (FOREVER-SUBMIT-RULE). Do not burn CI on it; flag the mismatch instead.
+    const any = io.receiptByVid?.get(vid.replace(/^\w+:/, ''));
+    if (any) { rec.submitted ??= any.createdAt; rec.receipt_mismatch = { receipt_id: any.id, campaign_id: any.campaignId, author_channel_id: any.socialMediaPost?.authorId, status: any.status, review_status: any.reviewStatus }; io.save(); io.log(`unregistered public ${tag(vid)}: CR receipt exists (${any.reviewStatus || any.status}) under another campaign/author; counted submitted`); continue; }
     if (now - since <= PUBLIC_SUBMIT_WINDOW) { io.log(`unregistered public ${vid} (${Math.floor((now - since) / 60e3)} min): submitting under its channel's only campaign`); out.set(vid, [rec.campaign, since]); continue; }
     rec.public_unsubmitted_alert = iso(now);
     io.save();
+    if (await dead(rec.campaign, state, io)) { deadWarn(io, vid, rec.campaign, 'unregistered public'); continue; }
     io.log(`WARNING: unregistered public ${vid} is past ${PUBLIC_SUBMIT_WINDOW / 60e3} min without a receipt`);
-    io.fatal.push(`PUBLIC-UNSUBMITTED ${vid}: unregistered public upload past ${PUBLIC_SUBMIT_WINDOW / 60e3} min without a submission receipt`);
+    io.fatal.push(`PUBLIC-UNSUBMITTED ${vid} [${tag(vid)}]: unregistered public upload past ${PUBLIC_SUBMIT_WINDOW / 60e3} min without a submission receipt`);
   }
   return out;
 }
@@ -676,8 +703,10 @@ async function submitClip(queue, state, now, io, vid, campaign, since) {
   if (res.stage === 'submitted') { rec.submitted = iso(Date.now()); delete rec.error; if (res.note) rec.note = res.note; if (res.receipt) rec.whop_receipt = res.receipt; }
   else { rec.error = `${res.stage}: ${res.error || ''}`.trim(); if (['unauthorized', 'blocked'].includes(res.stage)) io.fatal.push(`${vid}: ${rec.error}`); }
   // Auto-submit of a public monitor / unregistered clip failed: hard fail (exit 1) so it is emailed while there is time.
-  if (res.stage !== 'submitted' && (queue[vid]?.mode === 'monitor' || (!queue[vid] && rec.unmapped_public_at)))
-    io.fatal.push(`PUBLIC-UNSUBMITTED ${vid}: auto-submit failed (${res.stage})`);
+  if (res.stage !== 'submitted' && (queue[vid]?.mode === 'monitor' || (!queue[vid] && rec.unmapped_public_at))) {
+    if (await dead(campaign, state, io)) deadWarn(io, vid, campaign, 'auto-submit failed for public clip');
+    else io.fatal.push(`PUBLIC-UNSUBMITTED ${vid}: auto-submit failed (${res.stage})`);
+  }
   if (res.stage === 'refused' && /within 30 minutes|past (?:that |the )?window/i.test(res.error || '')) {
     rec.submission_terminal = 'Whop refused the posting-time window';
     io.fatal.push(`${vid}: Whop refused the posting-time window; preserve the public video and reconcile its first-public time`);
@@ -799,7 +828,7 @@ export async function igPass(queue, state, now, io) {
 // publishAt, an empty TikTok queue, public uploads with an ambiguous/unknown campaign, and a transient Google 5xx on YouTube token refresh (after one retry)
 // are expected. A revoked refresh token (invalid_grant) and a real Content Rewards / Whop failure still exit 1.
 // A public monitor / unregistered clip that is past 28 min or failed auto-submit is `PUBLIC-UNSUBMITTED <id>`: always exit 1.
-export const EXPECTED_FAILURE = /quotaExceeded|quota|rateLimitExceeded|publishAt|private hold|still private|not public yet|queue is empty|no tiktok|unregistered public uploads|no refresh token|transient google 5xx/i;
+export const EXPECTED_FAILURE = /dead campaign|quotaExceeded|quota|rateLimitExceeded|publishAt|private hold|still private|not public yet|queue is empty|no tiktok|unregistered public uploads|no refresh token|transient google 5xx/i;
 export function splitFatals(fatals) {
   const soft = [], hard = [];
   // PUBLIC-UNSUBMITTED is always hard, even if its text mentions an expected phrase.
@@ -828,6 +857,7 @@ async function main() {
     save: () => dry || writeFileSync(path.join(DIR, process.env.STATE_OUT || 'state.json'), JSON.stringify(state, null, 1) + '\n') };
   try {
     const rows = await readReceipts();
+    io.receiptByVid = new Map(rows.filter(r => r.socialMediaPost?.postId).map(r => [r.socialMediaPost.postId, r]));
     if (!dry) { const n = reconcileReceipts(queue, state, rows); if (n) { io.save(); io.log(`reconciled ${n} existing submission receipts`); } }
     else io.log(`receipt reconciliation readable: ${rows.length} records`);
   } catch (e) {
