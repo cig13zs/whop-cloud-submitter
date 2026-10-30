@@ -182,8 +182,8 @@ await test('expected quota and private holds soft-succeed; Whop, window, and unr
     'userRateLimitExceeded',
     'Unregistered public uploads need exact campaign/source/review records; no publish or submit permission inferred',
     'monitored clip x cannot verify visibility: no refresh token for UCx in YT_REFRESH_TOKENS',
-    'public monitored clip watch needs release checks and receipt reconciliation; never republish',
   ]).hard.length, 0);
+  assert.equal(splitFatals(['PUBLIC-UNSUBMITTED abc: public monitored clip is past 28 min; never republish', 'PUBLIC-UNSUBMITTED x: quota']).hard.length, 2);
   const hard = splitFatals([
     'a: YouTube visibility: 403 quotaExceeded',
     'whop session: HTTP 401 NOT_AUTHORIZED; nothing published',
@@ -231,7 +231,7 @@ await test('visibility batches stay separated by channel and dry runs do not per
 
 await test('channel feed discovers an unregistered public upload without guessing its campaign or submitting', async () => {
   feedXml = `<feed><entry><yt:videoId>externalNew</yt:videoId><published>${new Date(now - 60000).toISOString()}</published></entry></feed>`;
-  const state = {}, queue = { known: { campaign: CAMP, channel: 'UCx' } }, io = { fatal: [], log() {}, save() {} };
+  const state = {}, queue = { known: { campaign: CAMP, channel: 'UCx' }, other: { campaign: 'camp-2', channel: 'UCx' } }, io = { fatal: [], log() {}, save() {} };
   assert.equal(await discoverUnregistered(queue, state, now, io), 1);
   assert.equal(state.externalNew.source_channel, 'UCx'); assert.equal(state.externalNew.campaign, undefined);
   assert.equal(queue.externalNew, undefined); assert.equal(io.fatal.length, 1);
@@ -239,6 +239,23 @@ await test('channel feed discovers an unregistered public upload without guessin
   assert.equal(splitFatals(io.fatal).soft.length, 1);
   assert.equal(await discoverUnregistered(queue, state, now, io), 0);
   feedXml = '';
+});
+
+await test('unregistered public on a single-campaign channel is submitted inside 28 min, hard-fails past it', async () => {
+  feedXml = `<feed><entry><yt:videoId>soleNew</yt:videoId><published>${new Date(now - 60000).toISOString()}</published></entry></feed>`;
+  publicVids = new Set(['soleNew']);
+  const state = {}, queue = { known: { campaign: CAMP, at: '2026-10-01 20:00', channel: 'UCx' } };
+  const io = { fatal: [], log() {}, save() {} };
+  assert.equal(await discoverUnregistered(queue, state, now, io), 1);
+  assert.equal(state.soleNew.campaign, CAMP); assert.equal(io.fatal.length, 0);
+  const r = await run(queue, state);
+  assert.ok(r.calls.includes('submit soleNew')); assert.ok(state.soleNew.submitted); assert.deepEqual(r.fatal, []);
+  const old = { soleOld: { source_channel: 'UCx', campaign: CAMP, unmapped_public_at: new Date(now - 40 * 60000).toISOString() } };
+  const r2 = await run(queue, old);
+  assert.ok(!r2.calls.includes('submit soleOld'));
+  assert.match(r2.fatal.join(' | '), /PUBLIC-UNSUBMITTED soleOld/); assert.equal(splitFatals(r2.fatal).hard.length, 1);
+  assert.equal((await run(queue, old)).fatal.length, 0, 'alerts once');
+  feedXml = ''; publicVids = new Set();
 });
 
 await test('unregistered publics do not block a queued public clip in the same pass', async () => {
@@ -273,55 +290,41 @@ await test('missing refresh token uses oEmbed, does not fail, and does not block
   publicVids = new Set();
 });
 
-await test('monitor entries can never publish or submit; an early public clip raises an alert', async () => {
+await test('a public monitor clip with a campaign inside 28 min is submitted, never republished', async () => {
   const queue = { watch: { campaign: CAMP, at: '2026-10-01 13:00', source_channel: 'UCx', mode: 'monitor' } }, state = {};
   assert.deepEqual((await run(queue, state)).calls, []);
   publicVids = new Set(['watch']);
   const r = await run(queue, state, now + 15 * 60000);
-  assert.deepEqual(r.calls, []); assert.equal(r.fatal.length, 1); assert.ok(state.watch.coverage_alert);
-  assert.equal(splitFatals(r.fatal).hard.length, 0, 'a monitor release check must not exit 1');
-  assert.equal(splitFatals(r.fatal).soft.length, 1);
-  assert.equal((await run(queue, state)).fatal.length, 0);
+  assert.deepEqual(r.calls, ['submit watch']); assert.equal(r.fatal.length, 0);
+  assert.ok(state.watch.submitted); assert.ok(!r.calls.some(c => c.startsWith('publish')));
   publicVids = new Set();
 });
 
-await test('a public monitored clip warns, is isolated, and does not block other due submits', async () => {
-  publicVids = new Set(['watch', 'dueLive']);
+await test('a public monitor clip past 28 min hard-fails PUBLIC-UNSUBMITTED once and is never submitted or republished', async () => {
+  publishedDates.set('watchOld', now - 40 * 60000);
+  publicVids = new Set(['watchOld']);
   const dir = mkdtempSync(path.join(os.tmpdir(), 'reconcile-'));
   const file = path.join(dir, 'RECONCILE.json');
   try {
-    const queue = {
-      dueLive: { campaign: CAMP, at: '2026-10-01 11:50', channel: 'UCx' },
-      watch: { campaign: CAMP, at: '2026-10-01 13:00', source_channel: 'UCx', mode: 'monitor' },
-    };
-    const state = {};
+    const queue = { watchOld: { campaign: CAMP, at: '2026-10-01 11:00', source_channel: 'UCx', mode: 'monitor' } }, state = {};
     const r = await run(queue, state, now, { reconcileFile: file });
-    assert.deepEqual(r.calls.filter(c => c.startsWith('submit')), ['submit dueLive']);
-    assert.ok(!r.calls.some(c => c.startsWith('publish')), 'never republish a monitored public clip');
-    assert.ok(state.dueLive.submitted);
-    assert.ok(state.watch.coverage_alert);
-    assert.equal(state.watch.submitted, undefined);
-    assert.equal(splitFatals(r.fatal).hard.length, 0);
-    assert.match(r.fatal.join(' | '), /public monitored clip watch needs release checks and receipt reconciliation; never republish/);
-    const rows = JSON.parse(readFileSync(file, 'utf8'));
-    assert.equal(rows.length, 1);
-    assert.equal(rows[0].vid, 'watch');
-    assert.equal(rows[0].campaign, CAMP);
-    assert.equal(rows[0].action, 'never republish');
-    assert.equal(rows[0].reason, 'needs release checks and receipt reconciliation');
-    queue.dueNext = { campaign: CAMP, at: '2026-10-01 11:55', channel: 'UCx' };
-    publicVids.add('dueNext');
-    const again = await run(queue, state, now + 5 * 60000, { reconcileFile: file });
-    assert.equal(again.fatal.length, 0, 'the isolated clip must not fail the next pass');
-    assert.equal(splitFatals(again.fatal).hard.length, 0);
-    assert.deepEqual(again.calls.filter(c => c.startsWith('submit')), ['submit dueNext']);
-    assert.ok(!again.calls.some(c => c.startsWith('publish')), 'the monitored clip is never republished');
-    assert.equal(state.watch.submitted, undefined);
-    assert.ok(state.dueNext.submitted);
-  } finally {
-    publicVids = new Set();
-    rmSync(dir, { recursive: true, force: true });
-  }
+    assert.deepEqual(r.calls, []);
+    assert.match(r.fatal.join(' | '), /^PUBLIC-UNSUBMITTED watchOld/);
+    assert.equal(splitFatals(r.fatal).hard.length, 1);
+    assert.ok(state.watchOld.coverage_alert);
+    assert.equal(JSON.parse(readFileSync(file, 'utf8'))[0].vid, 'watchOld');
+    assert.equal((await run(queue, state, now + 60000, { reconcileFile: file })).fatal.length, 0);
+  } finally { publishedDates.delete('watchOld'); publicVids = new Set(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+await test('a failed auto-submit of a public monitor clip hard-fails PUBLIC-UNSUBMITTED', async () => {
+  publicVids = new Set(['watchFail']);
+  crResult.watchFail = { stage: 'refused', error: 'nope' };
+  try {
+    const r = await run({ watchFail: { campaign: CAMP, at: '2026-10-01 13:00', source_channel: 'UCx', mode: 'monitor' } }, {}, now + 15 * 60000);
+    assert.match(r.fatal.join(' | '), /PUBLIC-UNSUBMITTED watchFail: auto-submit failed/);
+    assert.equal(splitFatals(r.fatal).hard.length >= 1, true);
+  } finally { delete crResult.watchFail; publicVids = new Set(); }
 });
 
 await test('actual receipts bind campaign and author, clear duplicate errors, and keep rejection distinct', async () => {
