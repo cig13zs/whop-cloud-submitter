@@ -83,6 +83,12 @@ export async function oembedPublic(vid) {
   return false;
 }
 
+// Owner channel of a public video, read off its Shorts page (no API quota, no token).
+export async function videoChannel(vid) {
+  const html = await (await fetch(`https://www.youtube.com/shorts/${vid}`, { headers: { 'user-agent': UA, 'accept-language': 'en-US,en' } })).text();
+  return html.match(/"(?:externalChannelId|channelId)":"(UC[\w-]{22})"/)?.[1];
+}
+
 const access = {};
 const publicTimes = {};
 // A revoked refresh token is invalid_grant (HTTP 400). Do not treat that as a blip.
@@ -348,6 +354,26 @@ export function reconcileReceipts(queue, state, rows) {
   return changed;
 }
 
+// Instant submit (11-11): Grok dispatches whop-submit with video_ids the moment a clip goes public, so the submit
+// doesn't wait 17-23 min for the RSS feed. Only public videos on a channel-map.json channel are taken.
+export async function registerHints(ids, queue, state, now, io) {
+  let n = 0;
+  for (const vid of ids) {
+    if (queue[vid] || state[vid]?.submitted || state[vid]?.unmapped_public_at) { io.log(`hint ${tag(vid)}: already tracked`); continue; }
+    try {
+      if (!await net.oembedPublic(vid)) { io.log(`hint ${tag(vid)}: not public yet; skipped`); continue; }
+      const channel = await net.videoChannel(vid), campaign = CHANNEL_MAP[channel];
+      if (!campaign) { io.log(`hint ${tag(vid)}: channel ${channel ? tag(channel) : 'unknown'} is not in channel-map.json; skipped`); continue; }
+      io.log(`hint ${tag(vid)}: public on a mapped channel; submitting this run`);
+      if (io.dry) continue;
+      state[vid] = { ...state[vid], source_channel: channel, unmapped_public_at: iso(now), campaign, hinted: iso(now) };
+      n++;
+    } catch (e) { io.log(`hint ${tag(vid)} failed: ${e.message}`); }
+  }
+  if (n) io.save();
+  return n;
+}
+
 export async function discoverUnregistered(queue, state, now, io) {
   const channels = [...new Set([...Object.values(queue).map(q => q.channel || q.source_channel), ...Object.keys(CHANNEL_MAP)].filter(Boolean))];
   let added = 0, sole = 0;
@@ -413,7 +439,7 @@ function igRelease(args) {
   catch (e) { throw new Error(`gh release ${args[0]} failed (exit ${e.status ?? 'timeout'})`); }
 }
 
-export const net = { feed, isPublic, oembedPublic, videoStatuses, cap, publish, submit, whopCheck, ig: {
+export const net = { feed, isPublic, oembedPublic, videoChannel, videoStatuses, cap, publish, submit, whopCheck, ig: {
   me: () => igGet('me', 'user_id,username'),
   // Instagram Login takes Reels only by video_url: upload_type=resumable answered "The parameter video_url is
   // required" (probe run 37201477081, 2026-10-04). Meta fetches the file itself from link() below.
@@ -859,6 +885,7 @@ async function main() {
   if (process.env.GITHUB_ACTIONS)
     for (const [vid, q] of [...Object.entries(queue), ...Object.entries(state)])
       for (const v of [vid, vid.replace(/^\w+:/, ''), q.campaign, q.channel, q.source_channel, q.url, q.permalink]) if (v && String(v).length > 5) console.log(`::add-mask::${v}`);
+  if (process.env.GITHUB_ACTIONS) for (const v of (process.env.VIDEO_IDS || '').split(/[\s,]+/)) if (v.length > 5) console.log(`::add-mask::${v}`);
   // STATE_OUT: a laptop run (refresh-session.mjs --local) saves to laptop-state.json, so each file keeps one writer.
   const io = { dry, log: m => console.log(`${new Date().toISOString().slice(0, 19)}Z ${m}`), fatal: [],
     save: () => dry || writeFileSync(path.join(DIR, process.env.STATE_OUT || 'state.json'), JSON.stringify(state, null, 1) + '\n') };
@@ -873,6 +900,8 @@ async function main() {
     io.whop = 'receipt reconciliation unavailable';
     if (!dry) { process.exitCode = 1; return; }
   }
+  const hints = (process.env.VIDEO_IDS || '').split(/[\s,]+/).filter(v => /^[\w-]{11}$/.test(v));
+  if (hints.length) await registerHints(hints, queue, state, Date.now(), io);
   if (!dry) await discoverUnregistered(queue, state, Date.now(), io);
   if (dry) {
     io.log(`whop session: ${await whopCheck()}`);

@@ -21,6 +21,10 @@ on:
         description: 'Dry run only: ig-media asset name to upload as a never-published Reel container'
         type: string
         default: ''
+      video_ids:
+        description: 'Instant submit: comma-separated YouTube ids that just went public on a channel-map.json channel'
+        type: string
+        default: ''
 # No pull_request trigger on purpose: forks can never run this with the secrets. workflow_dispatch needs write access.
 concurrency:
   group: whop-submit
@@ -52,6 +56,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PROBE: ${{ inputs.dry_run && inputs.probe || '' }}
           IG_PROBE: ${{ inputs.dry_run && inputs.ig_probe || '' }}
+          VIDEO_IDS: ${{ inputs.video_ids || '' }}
       - name: Real miss only (public more than 25 min and still unsubmitted)
         if: always() && !inputs.dry_run
         env:

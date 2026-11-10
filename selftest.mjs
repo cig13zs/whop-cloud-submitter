@@ -1,7 +1,7 @@
 // Offline selftest for run.mjs: every HTTP call goes to a fake fetch, so the real request/parse code runs.
 // Cases: due, not-due, gap, 30-minute-expired, API-refused (YouTube and Content Rewards), duplicate, feed, cap, auth.
 import assert from 'node:assert/strict';
-import { mergeCookies, pass, slot, GAP, mergeLaptop, socialEntry, igPass, net, IG_VERSION, reconcileReceipts, discoverUnregistered, readVisibility, splitFatals, CHANNEL_MAP } from './run.mjs';
+import { mergeCookies, pass, slot, GAP, mergeLaptop, socialEntry, igPass, net, IG_VERSION, reconcileReceipts, discoverUnregistered, registerHints, readVisibility, splitFatals, CHANNEL_MAP } from './run.mjs';
 import { scan, missesToAlert } from './guard/watchdog.mjs';
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
@@ -253,6 +253,23 @@ await test('channel-map.json beats queue-history ambiguity: a mapped channel sub
     const r = await run(queue, state);
     assert.ok(r.calls.includes('submit mappedNew')); assert.ok(state.mappedNew.submitted);
   } finally { delete CHANNEL_MAP.UCx; feedXml = ''; }
+});
+
+await test('instant-submit hint: public video on a mapped channel submits this run; unmapped or private is skipped', async () => {
+  publicVids = new Set(['hintMapped', 'hintOther']);
+  CHANNEL_MAP.UCx = 'camp-mapped';
+  const realChannel = net.videoChannel;
+  net.videoChannel = async vid => (vid === 'hintOther' ? 'UCstranger' : 'UCx');
+  try {
+    const state = {}, queue = {}, io = { fatal: [], log() {}, save() {} };
+    assert.equal(await registerHints(['hintMapped', 'hintOther', 'hintPrivat'], queue, state, now, io), 1);
+    assert.equal(state.hintMapped.campaign, 'camp-mapped'); assert.equal(state.hintOther, undefined); assert.equal(state.hintPrivat, undefined);
+    assert.equal(await registerHints(['hintMapped'], queue, state, now, io), 0, 'a second hint for the same id is a no-op');
+    const dryState = {};
+    assert.equal(await registerHints(['hintMapped'], queue, dryState, now, { ...io, dry: true }), 0, 'dry runs only log');
+    const r = await run(queue, state);
+    assert.ok(r.calls.includes('submit hintMapped')); assert.ok(state.hintMapped.submitted);
+  } finally { delete CHANNEL_MAP.UCx; net.videoChannel = realChannel; publicVids = new Set(); }
 });
 
 await test('unregistered public on a single-campaign channel is submitted inside 28 min, hard-fails past it', async () => {
