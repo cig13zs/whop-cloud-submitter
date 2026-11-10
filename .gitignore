@@ -5,6 +5,7 @@ node_modules/
 queue.json
 state.json
 laptop-state.json
+channel-map.json
 _archive/
 # clip-id lists. The job logs a masked warning or REAL MISS line; these files stay off the public repo.
 SUBMIT-NOW.json
