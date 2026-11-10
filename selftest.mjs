@@ -255,11 +255,28 @@ await test('channel-map.json beats queue-history ambiguity: a mapped channel sub
   } finally { delete CHANNEL_MAP.UCx; feedXml = ''; }
 });
 
+await test('joint channel: the title/description rule picks the campaign; no rule hit stays unregistered', async () => {
+  const e = (id, title, desc = '') => `<entry><yt:videoId>${id}</yt:videoId><title>${title}</title><published>${new Date(now - 60000).toISOString()}</published><media:description>${desc}</media:description></entry>`;
+  feedXml = `<feed><title>Joint</title>${e('jointPet', 'Keep ONE: 1 or 2? | Pet Sim 99')}${e('jointRosb', 'Tsunami test', 'made in #RoSandBox')}${e('jointNone', 'random upload')}</feed>`;
+  publicVids = new Set(['jointPet', 'jointRosb', 'jointNone']);
+  // The mocked feed answers for every channel, so use the DEFAULTS channel: a joint map must also beat its Sartain default.
+  const JOINT = 'UC1xCBrygVPEwmmzLxSN_zNg';
+  CHANNEL_MAP[JOINT] = { 'pet ?sim': 'camp-pet', rosandbox: 'camp-rosb' };
+  try {
+    const state = {}, queue = {}, io = { fatal: [], log() {}, save() {} };
+    await discoverUnregistered(queue, state, now, io);
+    assert.equal(state.jointPet.campaign, 'camp-pet'); assert.equal(state.jointRosb.campaign, 'camp-rosb'); assert.equal(state.jointNone.campaign, undefined);
+    assert.equal(splitFatals(io.fatal).hard.length, 0, 'an unmatched joint upload is a soft warning');
+    const r = await run(queue, state);
+    assert.ok(r.calls.includes('submit jointPet') && r.calls.includes('submit jointRosb')); assert.ok(!r.calls.includes('submit jointNone'));
+  } finally { delete CHANNEL_MAP[JOINT]; feedXml = ''; publicVids = new Set(); }
+});
+
 await test('instant-submit hint: public video on a mapped channel submits this run; unmapped or private is skipped', async () => {
   publicVids = new Set(['hintMapped', 'hintOther']);
   CHANNEL_MAP.UCx = 'camp-mapped';
   const realChannel = net.videoChannel;
-  net.videoChannel = async vid => (vid === 'hintOther' ? 'UCstranger' : 'UCx');
+  net.videoChannel = async vid => ({ channel: vid === 'hintOther' ? 'UCstranger' : 'UCx', text: '' });
   try {
     const state = {}, queue = {}, io = { fatal: [], log() {}, save() {} };
     assert.equal(await registerHints(['hintMapped', 'hintOther', 'hintPrivat'], queue, state, now, io), 1);

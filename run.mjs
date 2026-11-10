@@ -31,6 +31,13 @@ const DEFAULTS = { UC1xCBrygVPEwmmzLxSN_zNg: '86842687-ba2b-4638-a024-995dcf3d25
 // posted outside queue.json; every public upload on a mapped channel is submitted under its campaign inside the
 // 30-min window (feed backstop below), and the map beats queue-history ambiguity.
 export const CHANNEL_MAP = {};
+// A channel-map.json value is one campaign id, or for a JOINT channel { "<regex>": "<campaign id>", ... }: the first
+// regex (case-insensitive) that hits the video's title + description picks the campaign. No hit = campaign unknown.
+export const campaignFor = (channel, text = '') => {
+  const m = CHANNEL_MAP[channel] ?? DEFAULTS[channel];
+  if (!m || typeof m === 'string') return m;
+  return Object.entries(m).find(([re]) => new RegExp(re, 'i').test(text))?.[1];
+};
 const USED_BEFORE = { '2c65001c-d6a8-4b14-9ba6-52400794b085': 5 }; // Alpha's 5 submissions made before any watcher
 const ORIGIN = 'https://b4e0vdqv6zgqeqj4pfgm.apps.whop.com';
 const PAGE = campaign => `${ORIGIN}/c/exp_zeADOv9rOOKk2x/campaigns/${campaign}`;
@@ -47,8 +54,8 @@ const iso = t => new Date(t).toISOString().replace('.000Z', 'Z');
 // ---- YouTube ------------------------------------------------------------------------------------------------------
 export async function feed(channel) {
   const xml = await (await fetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${channel}`, { headers: { 'user-agent': UA } })).text();
-  return [...xml.matchAll(/<entry>[\s\S]*?<yt:videoId>([^<]+)<\/yt:videoId>[\s\S]*?<published>([^<]+)<\/published>/g)]
-    .map(m => [m[1], Date.parse(m[2])]);
+  return xml.split('<entry>').slice(1).map(e => [e.match(/<yt:videoId>([^<]+)/)?.[1], Date.parse(e.match(/<published>([^<]+)/)?.[1]),
+    `${e.match(/<title>([^<]*)/)?.[1] || ''} ${e.match(/<media:description>([\s\S]*?)<\/media:description>/)?.[1] || ''}`]).filter(e => e[0] && e[1]);
 }
 
 // Social entries (queue key tt:<id> / ig:<code>, with platform and url) are TikTok / Instagram posts of a clip.
@@ -86,7 +93,8 @@ export async function oembedPublic(vid) {
 // Owner channel of a public video, read off its Shorts page (no API quota, no token).
 export async function videoChannel(vid) {
   const html = await (await fetch(`https://www.youtube.com/shorts/${vid}`, { headers: { 'user-agent': UA, 'accept-language': 'en-US,en' } })).text();
-  return html.match(/"(?:externalChannelId|channelId)":"(UC[\w-]{22})"/)?.[1];
+  return { channel: html.match(/"(?:externalChannelId|channelId)":"(UC[\w-]{22})"/)?.[1],
+    text: `${html.match(/<title>([^<]*)/)?.[1] || ''} ${html.match(/"shortDescription":"((?:[^"\\]|\\.)*)"/)?.[1] || ''}` };
 }
 
 const access = {};
@@ -362,8 +370,8 @@ export async function registerHints(ids, queue, state, now, io) {
     if (queue[vid] || state[vid]?.submitted || state[vid]?.unmapped_public_at) { io.log(`hint ${tag(vid)}: already tracked`); continue; }
     try {
       if (!await net.oembedPublic(vid)) { io.log(`hint ${tag(vid)}: not public yet; skipped`); continue; }
-      const channel = await net.videoChannel(vid), campaign = CHANNEL_MAP[channel];
-      if (!campaign) { io.log(`hint ${tag(vid)}: channel ${channel ? tag(channel) : 'unknown'} is not in channel-map.json; skipped`); continue; }
+      const { channel, text } = await net.videoChannel(vid), campaign = CHANNEL_MAP[channel] && campaignFor(channel, text);
+      if (!campaign) { io.log(`hint ${tag(vid)}: channel ${channel ? tag(channel) : 'unknown'} is not in channel-map.json, or no joint rule matched; skipped`); continue; }
       io.log(`hint ${tag(vid)}: public on a mapped channel; submitting this run`);
       if (io.dry) continue;
       state[vid] = { ...state[vid], source_channel: channel, unmapped_public_at: iso(now), campaign, hinted: iso(now) };
@@ -379,10 +387,10 @@ export async function discoverUnregistered(queue, state, now, io) {
   let added = 0, sole = 0;
   await Promise.all(channels.map(async channel => {
     try {
-      for (const [vid, at] of await net.feed(channel)) {
+      for (const [vid, at, text] of await net.feed(channel)) {
         if (queue[vid] || state[vid]?.submitted || state[vid]?.unmapped_public_at || now < at || now - at > 24 * 3600e3) continue;
         // Exactly one campaign on this channel -> submit under it (see candidates). Zero or several: ambiguous, soft.
-        const campaigns = CHANNEL_MAP[channel] ? [CHANNEL_MAP[channel]]
+        const campaigns = CHANNEL_MAP[channel] ? [campaignFor(channel, text)].filter(Boolean)
           : [...new Set([...Object.values(queue).filter(q => (q.channel || q.source_channel) === channel).map(q => q.campaign), DEFAULTS[channel]].filter(Boolean))];
         if (process.env.GITHUB_ACTIONS) console.log(`::add-mask::${vid}`); // public log: ids found after the start-up mask
         state[vid] = { ...state[vid], source_channel: channel, unmapped_public_at: iso(at), coverage_alert: iso(now), ...(campaigns.length === 1 ? { campaign: campaigns[0] } : {}) };
@@ -541,8 +549,8 @@ export async function candidates(queue, state, now, io) {
     if (status.error) throw status.error;
     return status.privacyStatus === 'public';
   };
-  for (const [channel, campaign] of Object.entries({ ...DEFAULTS, ...CHANNEL_MAP })) {
-    try { for (const [vid, t] of await net.feed(channel)) if (now - t <= WINDOW) out.set(vid, [campaign, t]); }
+  for (const channel of Object.keys({ ...DEFAULTS, ...CHANNEL_MAP })) {
+    try { for (const [vid, t, text] of await net.feed(channel)) { const campaign = campaignFor(channel, text); if (campaign && now - t <= WINDOW) out.set(vid, [campaign, t]); } }
     catch (e) { io.log(`feed ${channel}: ${e.message}`); } // a feed hiccup mustn't stop the queued videos
   }
   const pub = vid => state[vid]?.published || queue[vid].published;
@@ -882,7 +890,7 @@ async function main() {
   const queue = load('queue.json'), state = mergeLaptop(load('state.json'), existsSync(path.join(DIR, 'laptop-state.json')) ? load('laptop-state.json') : {});
   if (existsSync(path.join(DIR, 'channel-map.json'))) Object.assign(CHANNEL_MAP, load('channel-map.json').channels || {});
   // Public repo: Actions logs are public too, so mask every clip, campaign, channel and post id before anything prints.
-  if (process.env.GITHUB_ACTIONS) for (const [c, k] of Object.entries(CHANNEL_MAP)) console.log(`::add-mask::${c}\n::add-mask::${k}`);
+  if (process.env.GITHUB_ACTIONS) for (const [c, v] of Object.entries(CHANNEL_MAP)) for (const k of [c, ...(typeof v === 'string' ? [v] : Object.values(v))]) console.log(`::add-mask::${k}`);
   if (process.env.GITHUB_ACTIONS)
     for (const [vid, q] of [...Object.entries(queue), ...Object.entries(state)])
       for (const v of [vid, vid.replace(/^\w+:/, ''), q.campaign, q.channel, q.source_channel, q.url, q.permalink]) if (v && String(v).length > 5) console.log(`::add-mask::${v}`);
