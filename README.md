@@ -18,6 +18,8 @@ Cloud Actions submits. Nothing on the laptop has to be awake.
 
 YouTube Data API quota, or a channel missing from `YT_REFRESH_TOKENS`, does not fail the run. Visibility uses oEmbed, and a public clip that is already in the queue is still submitted. Those paths cannot flip a private video to public. Set `publishAt` when the clip is uploaded so YouTube publishes it; the cloud run only detects that and submits.
 
+**Channel map (2026-11-11).** Some clips are posted outside `queue.json`. `channel-map.json` (`{"channels": {"<UC id>": "<campaign id>"}}`, sealed as `channel-map.json.enc`, written by the operator only) gives each campaign channel exactly one campaign. Every public upload on a mapped channel is submitted under it inside the 30-minute window, and the map overrides the queue-history ambiguity below. With no map file the runner behaves as before.
+
 Public uploads that are not in `queue.json` are a warning. They stay unregistered (no campaign is inferred). Queued public clips in that same run are still submitted.
 
 A public clip queued with `mode: monitor` is a warning, not a failed run. The clip is skipped, written to `RECONCILE.json` for a human release check and receipt reconciliation, and never republished. Other due clips in that pass are still submitted.

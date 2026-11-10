@@ -1,7 +1,7 @@
 // Offline selftest for run.mjs: every HTTP call goes to a fake fetch, so the real request/parse code runs.
 // Cases: due, not-due, gap, 30-minute-expired, API-refused (YouTube and Content Rewards), duplicate, feed, cap, auth.
 import assert from 'node:assert/strict';
-import { mergeCookies, pass, slot, GAP, mergeLaptop, socialEntry, igPass, net, IG_VERSION, reconcileReceipts, discoverUnregistered, readVisibility, splitFatals } from './run.mjs';
+import { mergeCookies, pass, slot, GAP, mergeLaptop, socialEntry, igPass, net, IG_VERSION, reconcileReceipts, discoverUnregistered, readVisibility, splitFatals, CHANNEL_MAP } from './run.mjs';
 import { scan, missesToAlert } from './guard/watchdog.mjs';
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
@@ -239,6 +239,20 @@ await test('channel feed discovers an unregistered public upload without guessin
   assert.equal(splitFatals(io.fatal).soft.length, 1);
   assert.equal(await discoverUnregistered(queue, state, now, io), 0);
   feedXml = '';
+});
+
+await test('channel-map.json beats queue-history ambiguity: a mapped channel submits under its mapped campaign', async () => {
+  feedXml = `<feed><entry><yt:videoId>mappedNew</yt:videoId><published>${new Date(now - 60000).toISOString()}</published></entry></feed>`;
+  publicVids = new Set(['mappedNew']);
+  CHANNEL_MAP.UCx = 'camp-mapped';
+  try {
+    const state = {}, queue = { known: { campaign: CAMP, at: '2026-10-01 20:00', channel: 'UCx' }, other: { campaign: 'camp-2', at: '2026-10-01 21:00', channel: 'UCx' } };
+    const io = { fatal: [], log() {}, save() {} };
+    assert.equal(await discoverUnregistered(queue, state, now, io), 1);
+    assert.equal(state.mappedNew.campaign, 'camp-mapped'); assert.deepEqual(io.fatal, []);
+    const r = await run(queue, state);
+    assert.ok(r.calls.includes('submit mappedNew')); assert.ok(state.mappedNew.submitted);
+  } finally { delete CHANNEL_MAP.UCx; feedXml = ''; }
 });
 
 await test('unregistered public on a single-campaign channel is submitted inside 28 min, hard-fails past it', async () => {

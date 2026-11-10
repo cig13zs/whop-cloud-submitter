@@ -27,6 +27,10 @@ export const tag = vid => 'h' + createHash('sha256').update(String(vid).replace(
 export const TT_WINDOW = 3 * 3600e3;
 export const GAP = 5 * 60e3;       // min time between two publishes on one channel ("just uplaod everything now", 2026-09-30)
 const DEFAULTS = { UC1xCBrygVPEwmmzLxSN_zNg: '86842687-ba2b-4638-a024-995dcf3d25a3' }; // Charisma Tape -> Sartain, feed backstop
+// channel-map.json {"channels": {"<UC id>": "<campaign id>"}}: one campaign per channel (2026-11-11). Clips can be
+// posted outside queue.json; every public upload on a mapped channel is submitted under its campaign inside the
+// 30-min window (feed backstop below), and the map beats queue-history ambiguity.
+export const CHANNEL_MAP = {};
 const USED_BEFORE = { '2c65001c-d6a8-4b14-9ba6-52400794b085': 5 }; // Alpha's 5 submissions made before any watcher
 const ORIGIN = 'https://b4e0vdqv6zgqeqj4pfgm.apps.whop.com';
 const PAGE = campaign => `${ORIGIN}/c/exp_zeADOv9rOOKk2x/campaigns/${campaign}`;
@@ -345,14 +349,15 @@ export function reconcileReceipts(queue, state, rows) {
 }
 
 export async function discoverUnregistered(queue, state, now, io) {
-  const channels = [...new Set(Object.values(queue).map(q => q.channel || q.source_channel).filter(Boolean))];
+  const channels = [...new Set([...Object.values(queue).map(q => q.channel || q.source_channel), ...Object.keys(CHANNEL_MAP)].filter(Boolean))];
   let added = 0, sole = 0;
   await Promise.all(channels.map(async channel => {
     try {
       for (const [vid, at] of await net.feed(channel)) {
         if (queue[vid] || state[vid]?.submitted || state[vid]?.unmapped_public_at || now < at || now - at > 24 * 3600e3) continue;
         // Exactly one campaign on this channel -> submit under it (see candidates). Zero or several: ambiguous, soft.
-        const campaigns = [...new Set([...Object.values(queue).filter(q => (q.channel || q.source_channel) === channel).map(q => q.campaign), DEFAULTS[channel]].filter(Boolean))];
+        const campaigns = CHANNEL_MAP[channel] ? [CHANNEL_MAP[channel]]
+          : [...new Set([...Object.values(queue).filter(q => (q.channel || q.source_channel) === channel).map(q => q.campaign), DEFAULTS[channel]].filter(Boolean))];
         state[vid] = { ...state[vid], source_channel: channel, unmapped_public_at: iso(at), coverage_alert: iso(now), ...(campaigns.length === 1 ? { campaign: campaigns[0] } : {}) };
         if (campaigns.length === 1) { sole++; continue; }
         added++;
@@ -509,7 +514,7 @@ export async function candidates(queue, state, now, io) {
     if (status.error) throw status.error;
     return status.privacyStatus === 'public';
   };
-  for (const [channel, campaign] of Object.entries(DEFAULTS)) {
+  for (const [channel, campaign] of Object.entries({ ...DEFAULTS, ...CHANNEL_MAP })) {
     try { for (const [vid, t] of await net.feed(channel)) if (now - t <= WINDOW) out.set(vid, [campaign, t]); }
     catch (e) { io.log(`feed ${channel}: ${e.message}`); } // a feed hiccup mustn't stop the queued videos
   }
@@ -848,7 +853,9 @@ export function mergeLaptop(state, laptop) {
 async function main() {
   const dry = process.argv.includes('--dry-run');
   const queue = load('queue.json'), state = mergeLaptop(load('state.json'), existsSync(path.join(DIR, 'laptop-state.json')) ? load('laptop-state.json') : {});
+  if (existsSync(path.join(DIR, 'channel-map.json'))) Object.assign(CHANNEL_MAP, load('channel-map.json').channels || {});
   // Public repo: Actions logs are public too, so mask every clip, campaign, channel and post id before anything prints.
+  if (process.env.GITHUB_ACTIONS) for (const [c, k] of Object.entries(CHANNEL_MAP)) console.log(`::add-mask::${c}\n::add-mask::${k}`);
   if (process.env.GITHUB_ACTIONS)
     for (const [vid, q] of [...Object.entries(queue), ...Object.entries(state)])
       for (const v of [vid, vid.replace(/^\w+:/, ''), q.campaign, q.channel, q.source_channel, q.url, q.permalink]) if (v && String(v).length > 5) console.log(`::add-mask::${v}`);

@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
-export const DATA = ['queue.json', 'state.json', 'laptop-state.json'];
+export const DATA = ['queue.json', 'state.json', 'laptop-state.json', 'channel-map.json'];
 const KEY_FILE = process.env.WHOP_KEY_FILE || path.join(homedir(), '.claude', 'keys', 'whop-runner-data.key');
 let k;
 const key = () => k ??= Buffer.from(process.env.DATA_KEY || readFileSync(KEY_FILE, 'utf8').trim(), 'base64');
