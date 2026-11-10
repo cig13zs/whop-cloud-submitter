@@ -384,6 +384,7 @@ export async function discoverUnregistered(queue, state, now, io) {
         // Exactly one campaign on this channel -> submit under it (see candidates). Zero or several: ambiguous, soft.
         const campaigns = CHANNEL_MAP[channel] ? [CHANNEL_MAP[channel]]
           : [...new Set([...Object.values(queue).filter(q => (q.channel || q.source_channel) === channel).map(q => q.campaign), DEFAULTS[channel]].filter(Boolean))];
+        if (process.env.GITHUB_ACTIONS) console.log(`::add-mask::${vid}`); // public log: ids found after the start-up mask
         state[vid] = { ...state[vid], source_channel: channel, unmapped_public_at: iso(at), coverage_alert: iso(now), ...(campaigns.length === 1 ? { campaign: campaigns[0] } : {}) };
         if (campaigns.length === 1) { sole++; continue; }
         added++;
