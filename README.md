@@ -22,9 +22,9 @@ YouTube Data API quota, or a channel missing from `YT_REFRESH_TOKENS`, does not 
 
 Public uploads that are not in `queue.json` are a warning. They stay unregistered (no campaign is inferred). Queued public clips in that same run are still submitted.
 
-A public clip queued with `mode: monitor` is a warning, not a failed run. The clip is skipped, written to `RECONCILE.json` for a human release check and receipt reconciliation, and never republished. Other due clips in that pass are still submitted.
+A queued `mode: monitor` clip is submitted when it is publicly viewable, has a campaign, is at or past its scheduled slot, and is still inside 28 minutes. oEmbed public is enough on a channel with no refresh token. The run never republishes it. A private clip stays unsubmitted because oEmbed is not public, and the scheduled slot blocks an early submit. A public clip that still has no submission when that window closes fails the run (`PUBLIC-UNSUBMITTED`) and is written to `RECONCILE.json`. A paused or capped campaign remains a warning.
 
-The watchdog writes `REPOST-QUEUE.json` for clips public more than 28 minutes and exits 0 for those already-known misses. It exits 2 only for a new miss still inside the 25–28 minute submit window.
+The watchdog includes those monitor clips. It writes `REPOST-QUEUE.json` for clips public more than 28 minutes and exits 0 for those already-known misses. It exits 2 for a new miss still inside the 25–28 minute submit window.
 
 ## Public repo, encrypted data (since 2026-10-20)
 

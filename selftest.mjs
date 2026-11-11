@@ -373,6 +373,28 @@ await test('missing refresh token uses oEmbed, does not fail, and does not block
   publicVids = new Set();
 });
 
+await test('a public monitor clip with no refresh token is submitted after its slot, held before it, and hard-fails past 28 min', async () => {
+  publicVids = new Set(['noTokDue', 'noTokEarly', 'noTokOld']);
+  const queue = {
+    noTokDue: { campaign: CAMP, at: '2026-10-01 11:50', source_channel: 'UCmissing', mode: 'monitor' },
+    noTokEarly: { campaign: CAMP, at: '2026-10-01 13:00', source_channel: 'UCmissing', mode: 'monitor' },
+    noTokPriv: { campaign: CAMP, at: '2026-10-01 11:40', source_channel: 'UCmissing', mode: 'monitor' },
+    noTokOld: { campaign: CAMP, at: '2026-10-01 11:00', source_channel: 'UCmissing', mode: 'monitor' },
+  };
+  const state = {};
+  try {
+    const r = await run(queue, state);
+    assert.deepEqual(r.calls, ['submit noTokDue']);
+    assert.ok(state.noTokDue.submitted);
+    assert.ok(!r.calls.some(c => c.startsWith('publish')));
+    assert.ok(!state.noTokEarly?.submitted && !state.noTokEarly?.coverage_alert);
+    assert.ok(!state.noTokPriv?.submitted && !state.noTokPriv?.coverage_alert);
+    assert.ok(!state.noTokOld.submitted && state.noTokOld.coverage_alert);
+    assert.match(r.fatal.join(' | '), /PUBLIC-UNSUBMITTED noTokOld/);
+    assert.equal(splitFatals(r.fatal).hard.length, 1, r.fatal.join(' | '));
+  } finally { publicVids = new Set(); }
+});
+
 await test('a public monitor clip with a campaign inside 28 min is submitted, never republished', async () => {
   const queue = { watch: { campaign: CAMP, at: '2026-10-01 13:00', source_channel: 'UCx', mode: 'monitor' } }, state = {};
   assert.deepEqual((await run(queue, state)).calls, []);
@@ -972,10 +994,27 @@ await test('watchdog emails only a public clip still unsubmitted after 25 min', 
   };
   const r = await scan(queue, state, now, isPublic);
   assert.deepEqual(r.submitNow.map(x => x.vid).sort(), ['fresh', 'late']);
-  assert.deepEqual(r.repost.map(x => x.vid), ['repost']);
-  assert.deepEqual(r.misses.map(x => x.vid).sort(), ['late', 'repost']);
+  assert.deepEqual(r.repost.map(x => x.vid).sort(), ['mon', 'repost']);
+  assert.deepEqual(r.misses.map(x => x.vid).sort(), ['late', 'mon', 'repost']);
   const quiet = await scan({ held: queue.held, mon: queue.mon }, { held: {} }, now, async () => false);
   assert.deepEqual(quiet.misses, []);
+});
+
+await test('watchdog counts a public monitor clip that has a campaign and ignores a private one', async () => {
+  const pub = new Set(['monFresh', 'monLate']);
+  const isPublic = async vid => pub.has(vid);
+  const queue = {
+    monFresh: { campaign: CAMP, at: '2026-10-01 11:50', channel: 'UCmissing', mode: 'monitor' },
+    monLate: { campaign: CAMP, at: '2026-10-01 11:34', channel: 'UCmissing', mode: 'monitor' },
+    monPriv: { campaign: CAMP, at: '2026-10-01 11:40', channel: 'UCmissing', mode: 'monitor' },
+    monEarly: { campaign: CAMP, at: '2026-10-01 12:30', channel: 'UCmissing', mode: 'monitor' },
+    ig: { campaign: CAMP, at: '2026-10-01 11:30', platform: 'instagram', mode: 'api' },
+  };
+  const r = await scan(queue, {}, now, isPublic);
+  assert.deepEqual(r.submitNow.map(x => x.vid).sort(), ['monFresh', 'monLate']);
+  assert.deepEqual(r.repost, []);
+  assert.deepEqual(r.misses.map(x => x.vid), ['monLate']);
+  assert.deepEqual(missesToAlert(r.misses, r.repost).map(x => x.vid), ['monLate']);
 });
 
 await test('SKIP_OLD_MISSES_BEFORE drops burned repost ids and keeps new misses', async () => {
