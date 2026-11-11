@@ -1,11 +1,12 @@
 // Offline selftest for run.mjs: every HTTP call goes to a fake fetch, so the real request/parse code runs.
 // Cases: due, not-due, gap, 30-minute-expired, API-refused (YouTube and Content Rewards), duplicate, feed, cap, auth.
 import assert from 'node:assert/strict';
-import { mergeCookies, pass, slot, GAP, mergeLaptop, socialEntry, igPass, net, IG_VERSION, reconcileReceipts, discoverUnregistered, registerHints, checkWatched, parseHints, readVisibility, splitFatals, CHANNEL_MAP, VIDEO_MAP } from './run.mjs';
+import { mergeCookies, pass, slot, GAP, mergeLaptop, socialEntry, igPass, net, IG_VERSION, reconcileReceipts, discoverUnregistered, registerHints, checkWatched, parseHints, registerFromFiles, ackText, readVisibility, splitFatals, CHANNEL_MAP, VIDEO_MAP } from './run.mjs';
 import { mergeMap, lookup, formatValue } from './map-edit.mjs';
 import { scan, missesToAlert } from './guard/watchdog.mjs';
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
+import { generateKeyPairSync, publicEncrypt } from 'node:crypto';
 import path from 'node:path';
 
 const CAMP = 'camp-1', SARTAIN = '86842687-ba2b-4638-a024-995dcf3d25a3';
@@ -32,6 +33,7 @@ globalThis.fetch = async (url, opt = {}) => {
   }
   if (url.includes('/api/campaign/campaigns/')) {
     const id = url.split('/').pop();
+    if (campaignStatus[id]?.missing) return json({ success: false }, 404);
     if (campaignStatus[id]?.broken) return json({ success: false });
     return json({ data: { status: campaignStatus[id]?.status || 'active', configuration: campaignStatus[id]?.cap ? { maxSubmissionsPerUser: campaignStatus[id].cap } : {} } });
   }
@@ -335,7 +337,7 @@ await test('registered at schedule time: a private VIDEOID=CAMPAIGN is watched, 
   const GIVEN = '11111111-2222-3333-4444-555555555555', BAD = '99999999-2222-3333-4444-555555555555';
   assert.deepEqual(parseHints(`regPrivate1=${GIVEN.toUpperCase()}, regNoCamp11 regBad=x short`), [['regPrivate1', GIVEN.toUpperCase()], ['regNoCamp11', undefined], 'regBad=x', 'short']);
   CHANNEL_MAP.UCx = 'camp-mapped';
-  campaignStatus[BAD] = { broken: true };
+  campaignStatus[BAD] = { missing: true };
   const realChannel = net.videoChannel, realSubmit = net.submit, sent = {};
   net.videoChannel = async vid => ({ channel: vid === 'regOrphan11' ? 'UCstranger' : 'UCx', text: '' });
   net.submit = async (vid, campaign, url) => { sent[vid] = campaign; return realSubmit(vid, campaign, url); };
@@ -369,6 +371,35 @@ await test('registered at schedule time: a private VIDEOID=CAMPAIGN is watched, 
     // 21 days without going public: the watch is dropped, nothing is submitted.
     assert.equal(await checkWatched(queue, state, now + 22 * 864e5, io), 1); assert.equal(state.regLater111.watch, undefined);
   } finally { delete CHANNEL_MAP.UCx; delete campaignStatus[BAD]; net.videoChannel = realChannel; net.submit = realSubmit; feedXml = ''; publicVids = new Set(); }
+});
+
+await test('register/ lines: an encrypted entry registers once, a refused line fails one run and is then skipped, the ack carries no ids', async () => {
+  const { publicKey, privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048, publicKeyEncoding: { type: 'spki', format: 'pem' }, privateKeyEncoding: { type: 'pkcs8', format: 'pem' } });
+  const enc = s => publicEncrypt({ key: publicKey, oaepHash: 'sha256' }, Buffer.from(s)).toString('base64');
+  const GIVEN = '11111111-2222-3333-4444-555555555555', BAD = '99999999-2222-3333-4444-555555555555';
+  campaignStatus[BAD] = { missing: true };
+  const good = enc(`fileWatch11=${GIVEN}`);
+  const text = ['# a comment', good, good, enc(`fileBadCmp1=${BAD}`), 'not-a-cipher-line', ''].join('\r\n');
+  const realChannel = net.videoChannel;
+  net.videoChannel = async () => ({ channel: 'UCstranger', text: '' });
+  try {
+    const state = {}, queue = {}, io = { fatal: [], log() {}, save() {} };
+    let rows = await registerFromFiles(text, '', privateKey, queue, state, now, io);
+    const ack = ackText(rows, queue, state);
+    assert.equal(rows.length, 3, 'a repeated line counts once');
+    assert.ok(state.fileWatch11.watch); assert.equal(state.fileWatch11.campaign, GIVEN); assert.equal(state.fileBadCmp1, undefined);
+    assert.equal(splitFatals(io.fatal).hard.length, 2, 'the unknown campaign and the unreadable line each fail this run');
+    assert.match(ack, /^[0-9a-f]{12} watching$/m); assert.equal(ack.match(/REJECTED/g).length, 2);
+    for (const secret of ['fileWatch11', 'fileBadCmp1', GIVEN, BAD]) assert.ok(!ack.includes(secret), 'the public ack must not carry ids');
+    io.fatal.length = 0;
+    rows = await registerFromFiles(text, ack, privateKey, queue, state, now, io);
+    assert.deepEqual(io.fatal, [], 'refused lines alert once'); assert.equal(ackText(rows, queue, state), ack);
+    publicVids = new Set(['fileWatch11']);
+    assert.equal(await checkWatched(queue, state, now + 60000, io), 1);
+    const r = await run(queue, state, now + 60000);
+    assert.ok(r.calls.includes('submit fileWatch11'));
+    assert.match(ackText(rows, queue, state), /^[0-9a-f]{12} submitted$/m);
+  } finally { delete campaignStatus[BAD]; net.videoChannel = realChannel; publicVids = new Set(); }
 });
 
 await test('a dead YouTube feed (HTTP 404) is one warning, not silence, and queued clips still submit', async () => {

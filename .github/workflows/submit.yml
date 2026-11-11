@@ -85,7 +85,8 @@ jobs:
         run: |
           node crypt.mjs seal state.json
           if [ -f /tmp/map-applied ]; then node crypt.mjs seal channel-map.json; fi
-          git add -- channel-map.json.enc state.json.enc
+          # registrations.ack: per-line answers to register/*.txt (line hashes only, no ids)
+          git add -- channel-map.json.enc state.json.enc registrations.ack
           if [ -f /tmp/map-applied ]; then git rm -q --ignore-unmatch channel-map.override.json; fi
           if git diff --cached --name-only --diff-filter=A | grep -E '\.json$'; then echo "refusing to commit plaintext json"; exit 1; fi
           git diff --cached --quiet && exit 0

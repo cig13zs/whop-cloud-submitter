@@ -7,9 +7,9 @@
 //   node run.mjs --dry-run    checks the secrets with read-only calls, prints what it would publish and submit
 //
 // Never prints a cookie or token: errors carry HTTP statuses and API error codes only.
-import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync, statSync, createReadStream } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync, statSync, createReadStream, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, privateDecrypt } from 'node:crypto';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -380,10 +380,10 @@ export async function registerHints(ids, queue, state, now, io) {
     const rec = state[vid];
     if (queue[vid] || rec?.submitted || rec?.unmapped_public_at) { io.log(`hint ${tag(vid)}: already tracked`); continue; }
     try {
-      // Check a given campaign now, while a typo can still be fixed. Only a real "no such campaign" answer rejects;
-      // a network blip or 5xx keeps the registration.
+      // Check a given campaign now, while a typo can still be fixed. Only a real "no such campaign" answer (404/400)
+      // rejects; a network blip, a 5xx, a rate limit or a Cloudflare 403 keeps the registration.
       if (given) {
-        const bad = await net.cap(given).then(() => '', e => /HTTP [1-4]\d\d/.test(e.message) ? e.message : '');
+        const bad = await net.cap(given).then(() => '', e => /HTTP 40[04]/.test(e.message) ? e.message : '');
         if (bad) { io.fatal.push(`REGISTER-REJECTED ${tag(vid)}: Content Rewards does not know that campaign id`); continue; }
       }
       if (!await net.oembedPublic(vid)) {
@@ -411,6 +411,43 @@ export async function registerHints(ids, queue, state, now, io) {
   if (n) io.save();
   return n;
 }
+
+// File registrations (11-11): Grok's box cannot dispatch a workflow, but it can commit files. Every non-comment line
+// of register/*.txt is one registration, encrypted to register.pub (RSA-OAEP-SHA256, base64) because this repo is
+// public; it decrypts to the same "VIDEOID" or "VIDEOID=CAMPAIGN-UUID" entry video_ids takes. A line already in
+// state costs nothing. A refused line fails one run and is then skipped: the fix is a new line, not an edit.
+// Returns rows [line hash, entry | null, fixed status] for ackText.
+export async function registerFromFiles(text, prevAck, pem, queue, state, now, io) {
+  const prev = new Map(prevAck.split('\n').filter(l => /^[0-9a-f]{12} /.test(l)).map(l => [l.slice(0, 12), l.slice(13)]));
+  const rows = [];
+  for (const line of new Set(text.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#')))) {
+    const h = createHash('sha256').update(line).digest('hex').slice(0, 12);
+    if (prev.get(h)?.startsWith('REJECTED')) { rows.push([h, null, prev.get(h)]); continue; }
+    let entry;
+    try { entry = parseHints(privateDecrypt({ key: pem, oaepHash: 'sha256' }, Buffer.from(line, 'base64')).toString('utf8'))[0]; } catch { /* not ours, or damaged */ }
+    if (!Array.isArray(entry)) {
+      rows.push([h, null, 'REJECTED unreadable: encrypt VIDEOID=CAMPAIGN-UUID to register.pub, one per line']);
+      io.fatal.push(`REGISTER-REJECTED: register/ line ${h} is unreadable`);
+      continue;
+    }
+    if (process.env.GITHUB_ACTIONS) for (const v of entry) if (v) console.log(`::add-mask::${v}`);
+    rows.push([h, entry]);
+  }
+  const known = ([vid, given]) => { const r = state[vid]; return queue[vid] || r?.submitted || r?.unmapped_public_at || (r?.watch && (!given || r.campaign === given.toLowerCase())); };
+  const fresh = rows.filter(r => r[1] && !known(r[1]));
+  if (fresh.length) await registerHints(fresh.map(r => r[1]), queue, state, now, io);
+  for (const r of fresh) {
+    const why = !state[r[1][0]]?.watch && !state[r[1][0]]?.unmapped_public_at && io.fatal.find(f => f.includes(`REGISTER-REJECTED ${tag(r[1][0])}:`));
+    if (why) r[2] = `REJECTED ${why.split(': ').slice(1).join(': ')}`;
+  }
+  return rows;
+}
+// registrations.ack (public, no ids): one "<line hash> <status>" per registration, rewritten when it changes.
+export const ackText = (rows, queue, state) => '# sha256 of each register/ line (first 12 hex), then what the runner did with it\n' + rows.map(([h, entry, fixed]) => {
+  const r = (entry && state[entry[0]]) || {};
+  return `${h} ${fixed || (r.submitted ? 'submitted' : r.submission_terminal ? 'refused by Content Rewards' : r.public_unsubmitted_alert ? 'MISSED: public past 28 min without a submit'
+    : r.unmapped_public_at ? 'public, submitting' : r.watch ? 'watching' : queue[entry[0]] ? 'queued' : 'pending, retried next run')}`;
+}).join('\n') + '\n';
 
 // Registered videos that were still private: one oEmbed read each per run. The run that first sees one public stamps
 // it, and candidates() submits it in the same run under its registered campaign (else the channel map's).
@@ -999,6 +1036,12 @@ async function main() {
   // A malformed entry fails the run (red, emailed): a silently dropped registration is a missed submit later.
   if (parsed.length > hints.length) io.fatal.push(`REGISTER-REJECTED: ${parsed.length - hints.length} malformed video_ids entries (want VIDEOID or VIDEOID=CAMPAIGN-UUID)`);
   if (hints.length) await registerHints(hints, queue, state, Date.now(), io);
+  const regDir = path.join(DIR, 'register'), ackFile = path.join(DIR, 'registrations.ack');
+  let regRows = [];
+  if (!dry && existsSync(regDir) && existsSync(path.join(DIR, 'register-key.json'))) {
+    const text = readdirSync(regDir).filter(f => f.endsWith('.txt')).sort().map(f => readFileSync(path.join(regDir, f), 'utf8')).join('\n');
+    regRows = await registerFromFiles(text, existsSync(ackFile) ? readFileSync(ackFile, 'utf8') : '', load('register-key.json').pem, queue, state, Date.now(), io);
+  }
   if (!dry) await checkWatched(queue, state, Date.now(), io);
   if (!dry) await discoverUnregistered(queue, state, Date.now(), io);
   if (dry) {
@@ -1038,6 +1081,7 @@ async function main() {
   else try { await igPass(queue, state, Date.now(), io); }
   catch (e) { io.fatal.push(redactIG(e.message)); }
   await pass(queue, state, Date.now(), io);
+  if (regRows.length) { const ack = ackText(regRows, queue, state); if (!existsSync(ackFile) || readFileSync(ackFile, 'utf8') !== ack) writeFileSync(ackFile, ack); }
   const { soft, hard } = splitFatals(io.fatal);
   if (soft.length) console.log(`::warning::SOFT (expected, no failure): ${soft.join(' | ')}`);
   if (hard.length) { console.error(`FAILED: ${hard.join(' | ')}`); process.exitCode = 1; } // real failure -> GitHub emails
