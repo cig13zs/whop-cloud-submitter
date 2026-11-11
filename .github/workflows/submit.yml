@@ -46,6 +46,21 @@ jobs:
         run: node crypt.mjs open
         env:
           DATA_KEY: ${{ secrets.DATA_KEY }}
+      - name: Merge one-shot channel-map override
+        env:
+          DATA_KEY: ${{ secrets.DATA_KEY }}
+          DRY: ${{ inputs.dry_run && 'true' || 'false' }}
+        run: |
+          if [ ! -f channel-map.override.json ]; then exit 0; fi
+          node map-edit.mjs resolve-file channel-map.override.json before || true
+          if ! node map-edit.mjs apply-file channel-map.override.json; then
+            echo "map apply failed; submissions continue on the previous map"
+            exit 0
+          fi
+          node map-edit.mjs resolve-file channel-map.override.json after || true
+          if [ "$DRY" = "true" ]; then exit 0; fi
+          node map-edit.mjs register channel-map.override.json || echo "register failed; feed path still submits mapped channels"
+          touch /tmp/map-applied
       - name: Publish due clips and submit them
         run: node run.mjs ${{ inputs.dry_run && '--dry-run' || '' }}
         env:
@@ -69,9 +84,34 @@ jobs:
           DATA_KEY: ${{ secrets.DATA_KEY }}
         run: |
           node crypt.mjs seal state.json
-          git diff --quiet state.json.enc && exit 0
+          if [ -f /tmp/map-applied ]; then node crypt.mjs seal channel-map.json; fi
+          git add -- channel-map.json.enc state.json.enc
+          if [ -f /tmp/map-applied ]; then git rm -q --ignore-unmatch channel-map.override.json; fi
+          if git diff --cached --name-only --diff-filter=A | grep -E '\.json$'; then echo "refusing to commit plaintext json"; exit 1; fi
+          git diff --cached --quiet && exit 0
           git config user.name whop-cloud
           git config user.email whop-cloud@users.noreply.github.com
-          git commit -q -m "state $(date -u +%FT%TZ)" state.json.enc
+          msg="state $(date -u +%FT%TZ)"
+          if [ -f /tmp/map-applied ]; then msg="$msg; map lrnsdc channels (FROM-GROK 014)"; fi
+          git commit -q -m "$msg"
           for i in 1 2 3; do git pull -q --rebase && git push -q && exit 0; sleep 5; done
           exit 1
+  readback:
+    needs: pass
+    if: always() && (needs.pass.result == 'success' || needs.pass.result == 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned
+        with:
+          ref: ${{ github.sha }}
+      - name: Print channel and video campaign ids
+        env:
+          DATA_KEY: ${{ secrets.DATA_KEY }}
+        run: |
+          if [ ! -f channel-map.override.json ]; then echo "no override; read-back skipped"; exit 0; fi
+          git fetch --no-tags origin "${GITHUB_REF_NAME}"
+          git checkout FETCH_HEAD -- channel-map.json.enc
+          node crypt.mjs open
+          node map-edit.mjs resolve-file channel-map.override.json readback
+          rm -f channel-map.json queue.json state.json laptop-state.json

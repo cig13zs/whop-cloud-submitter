@@ -3,8 +3,10 @@
 // (YouTube/TikTok, no API quota), writes SUBMIT-NOW.json (public, unsubmitted, <=28 min) and REPOST-QUEUE.json (>28 min).
 // Exit 2 only for a new miss still inside the submit window (public 25–28 min). Clips already in
 // REPOST-QUEUE (public >28 min) are logged and do not fail the run. Quota never alerts.
-// A monitor clip with a campaign is a submit candidate once oEmbed says it is public. Instagram API
-// entries are staged by this runner, so a public one is not a missed Content Rewards post.
+// A monitor clip with a campaign is a submit candidate once oEmbed says it is public, including a
+// tokenless channel. A mapped or registered clip that is not a queue row is counted the same way once
+// it has a campaign and a public time. Instagram API entries are staged by this runner, so a public one
+// is not a missed Content Rewards post.
 //   node guard/watchdog.mjs queue.json state.json [outdir]
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -27,6 +29,20 @@ export async function scan(queue, state, now, isPublic) {
     const row = { vid, campaign: q.campaign, platform: q.platform || 'youtube', url: q.url || `https://www.youtube.com/shorts/${vid}`, age_min: Math.round(age), since: new Date(since).toISOString() };
     (age > 28 ? repost : submitNow).push(row);
     if (age > 25) misses.push(row);
+  }
+  // Channel-map discoveries and video_ids watches are not queue rows. Once public with a campaign,
+  // count them. A still-private watch has no public time, so it is not a miss.
+  for (const [vid, s] of Object.entries(state)) {
+    if (vid.startsWith('_') || queue[vid] || !s || typeof s !== 'object') continue;
+    if (s.submitted || s.submission_terminal || !s.campaign) continue;
+    const sinceMs = Date.parse(s.published || s.unmapped_public_at || '');
+    if (!Number.isFinite(sinceMs)) continue;
+    const mappedAge = (now - sinceMs) / 60e3;
+    if (mappedAge < -2 || mappedAge > 180) continue;
+    if (!(await isPublic(vid, { url: `https://www.youtube.com/watch?v=${vid}` }))) continue;
+    const row = { vid, campaign: s.campaign, platform: 'youtube', url: `https://www.youtube.com/shorts/${vid}`, age_min: Math.round(mappedAge), since: new Date(sinceMs).toISOString() };
+    (mappedAge > 28 ? repost : submitNow).push(row);
+    if (mappedAge > 25) misses.push(row);
   }
   return { submitNow, repost, misses };
 }

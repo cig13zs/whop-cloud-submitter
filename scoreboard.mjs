@@ -8,12 +8,14 @@
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { CHANNEL_MAP, campaignFor } from './run.mjs';
+import { CHANNEL_MAP, VIDEO_MAP, campaignFor } from './run.mjs';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const arg = (k, d) => { const i = process.argv.indexOf(k); return i > 0 ? process.argv[i + 1] : d; };
 const DAYS = +arg('--days', 7), OUT = arg('--out', ''), LOG = arg('--log', ''), now = Date.now();
-Object.assign(CHANNEL_MAP, JSON.parse(readFileSync(path.join(DIR, 'channel-map.json'), 'utf8')).channels || {});
+const mapFile = JSON.parse(readFileSync(path.join(DIR, 'channel-map.json'), 'utf8'));
+Object.assign(CHANNEL_MAP, mapFile.channels || {});
+Object.assign(VIDEO_MAP, mapFile.videos || {});
 
 const campaigns = {};
 async function campaign(id) {
@@ -31,7 +33,7 @@ for (const channel of Object.keys(CHANNEL_MAP)) {
   const name = xml.match(/<title>([^<]*)/)?.[1] || channel;
   const all = xml.split('<entry>').slice(1).map(e => ({ channel: name, vid: e.match(/<yt:videoId>([^<]+)/)?.[1], at: Date.parse(e.match(/<published>([^<]+)/)?.[1]),
     title: (e.match(/<title>([^<]*)/)?.[1] || '').replace(/&amp;/g, '&'), views: +(e.match(/<media:statistics views="(\d+)"/)?.[1] || 0), likes: +(e.match(/<media:starRating count="(\d+)"/)?.[1] || 0),
-    campaignId: campaignFor(channel, `${e.match(/<title>([^<]*)/)?.[1] || ''} ${e.match(/<media:description>([\s\S]*?)<\/media:description>/)?.[1] || ''}`) }));
+    campaignId: VIDEO_MAP[e.match(/<yt:videoId>([^<]+)/)?.[1]] || campaignFor(channel, `${e.match(/<title>([^<]*)/)?.[1] || ''} ${e.match(/<media:description>([\s\S]*?)<\/media:description>/)?.[1] || ''}`) }));
   const settled = all.filter(c => now - c.at > 48 * 3600e3).map(c => c.views).sort((a, b) => a - b);
   const median = settled.length ? settled[Math.floor(settled.length / 2)] : 0;
   channels.push({ name, median, n: all.length });
