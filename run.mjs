@@ -566,29 +566,36 @@ export async function candidates(queue, state, now, io) {
     if (q.mode === 'monitor') {
       out.delete(vid);
       if (state[vid]?.coverage_alert) continue;
-      let visible = false;
+      let visible = false, oembedOnly = false;
       const status = visibility.get(vid);
       try { visible = await visibleNow(vid, q); }
       catch (e) {
         io.log(`monitored clip ${vid} visibility: ${e.message}`);
-        // Quota or a missing refresh token: oEmbed is the public check. Do not fail the run.
+        // Quota or a missing refresh token: oEmbed is the public check. A public clip still submits below.
         if (apiBlind(e.message)) {
-          let pub = false;
-          try { pub = (!q.platform || q.platform === 'youtube') && await net.oembedPublic(vid); } catch { /* still not a run failure */ }
-          io.holds = (io.holds || 0) + 1;
-          io.log(`monitored clip ${vid}: oEmbed public=${pub}; not failing (Data API unavailable)`);
-          continue;
-        }
-        if (!state[vid]?.coverage_error) { (state[vid] ??= { campaign: q.campaign }).coverage_error = iso(now); io.save(); io.fatal.push(`monitored clip ${vid} cannot verify visibility: ${e.message}`); }
+          try { visible = (!q.platform || q.platform === 'youtube') && await net.oembedPublic(vid); } catch { /* still unknown */ }
+          io.log(`monitored clip ${vid}: oEmbed public=${!!visible}; Data API unavailable`);
+          if (!visible) { io.holds = (io.holds || 0) + 1; continue; }
+          oembedOnly = true;
+        } else if (!state[vid]?.coverage_error) { (state[vid] ??= { campaign: q.campaign }).coverage_error = iso(now); io.save(); io.fatal.push(`monitored clip ${vid} cannot verify visibility: ${e.message}`); }
       }
-      if (visible && status?.via === 'oembed') {
+      if (status?.via === 'oembed') oembedOnly = true;
+      if (!visible) continue;
+      const at = slot(q.at);
+      // oEmbed is not public for a private or scheduled clip. A public oEmbed before the queue slot
+      // is not submitted: without an authenticated privacy read, the slot is the early-submit guard.
+      if (oembedOnly && Number.isFinite(at) && now < at) {
         io.holds = (io.holds || 0) + 1;
-        io.log(`monitored clip ${vid}: oEmbed public without the Data API; release alert waits for an authenticated read`);
+        io.log(`monitored clip ${vid}: oEmbed public before slot ${q.at}; holding`);
         continue;
       }
       if (visible && !state[vid]?.coverage_alert) {
         const rec = state[vid] ??= { campaign: q.campaign };
-        const since = publicTimes[vid] ? Date.parse(publicTimes[vid]) : now;
+        const recorded = Date.parse(rec.published || '');
+        // No Data API publishedAt (no refresh token, or quota). The slot is when this clip was scheduled
+        // to go public; the 28-minute submit window is measured from that time.
+        const since = publicTimes[vid] ? Date.parse(publicTimes[vid])
+          : (Number.isFinite(recorded) ? recorded : (oembedOnly && Number.isFinite(at) ? at : now));
         if (q.campaign && now - since <= PUBLIC_SUBMIT_WINDOW && !rec.submission_terminal) {
           // Already public with a campaign and still inside the window: submit it (never republish). A failed attempt
           // is retried next run until the window closes, then hard-fails below.

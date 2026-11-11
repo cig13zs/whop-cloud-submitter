@@ -3,7 +3,8 @@
 // (YouTube/TikTok, no API quota), writes SUBMIT-NOW.json (public, unsubmitted, <=28 min) and REPOST-QUEUE.json (>28 min).
 // Exit 2 only for a new miss still inside the submit window (public 25–28 min). Clips already in
 // REPOST-QUEUE (public >28 min) are logged and do not fail the run. Quota never alerts.
-// Monitor and Instagram API entries are not submit candidates, so a public one is not a missed Content Rewards post.
+// A monitor clip with a campaign is a submit candidate once oEmbed says it is public. Instagram API
+// entries are staged by this runner, so a public one is not a missed Content Rewards post.
 //   node guard/watchdog.mjs queue.json state.json [outdir]
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -17,7 +18,8 @@ export async function scan(queue, state, now, isPublic) {
   for (const [vid, q] of Object.entries(queue)) {
     const s = state[vid] || {};
     if (s.submitted || s.submission_terminal || !q.at) continue;
-    if (q.mode === 'monitor' || q.mode === 'api' || q.platform === 'instagram') continue;
+    if (q.mode === 'api' || q.platform === 'instagram') continue;
+    if (q.mode === 'monitor' && !q.campaign) continue;
     const since = s.published ? Date.parse(s.published) : slot(q.at);
     const age = (now - since) / 60e3;
     if (!Number.isFinite(age) || age < -2 || age > 180) continue;
