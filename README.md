@@ -18,7 +18,9 @@ Cloud Actions submits. Nothing on the laptop has to be awake.
 
 YouTube Data API quota, or a channel missing from `YT_REFRESH_TOKENS`, does not fail the run. Visibility uses oEmbed, and a public clip that is already in the queue is still submitted. Those paths cannot flip a private video to public. Set `publishAt` when the clip is uploaded so YouTube publishes it; the cloud run only detects that and submits.
 
-**Channel map (2026-11-11).** Some clips are posted outside `queue.json`. `channel-map.json` (`{"channels": {"<UC id>": "<campaign id>"}}`, sealed as `channel-map.json.enc`, written by the operator only) gives each campaign channel exactly one campaign. Every public upload on a mapped channel is submitted under it inside the 30-minute window, and the map overrides the queue-history ambiguity below. With no map file the runner behaves as before.
+**Channel map (2026-11-11).** Some clips are posted outside `queue.json`. `channel-map.json` (`{"channels": {"<UC id>": "<campaign id>"}, "videos": {"<video id>": "<campaign id>"}}`, sealed as `channel-map.json.enc`) gives each campaign channel exactly one campaign. A `videos` entry wins over the channel default, a joint title rule, and a monitor row. Every public upload on a mapped channel in the last 24 hours is submitted under it inside the 30-minute window, including a clip uploaded and made public the same day with no queue row. The map overrides the queue-history ambiguity below. With no map file the runner behaves as before.
+
+`channel-map.override.json` is a one-shot patch (`channels`, `videos`, `register`, `resolve`). The next `whop-submit` run merges it into the sealed map, registers `VIDEOID=CAMPAIGN-UUID` clips, prints `id -> campaign id`, and deletes the file. It is not a second map.
 
 **Registering a clip (2026-11-11).** This is how a clip posted outside `queue.json` reaches the runner. Dispatch `whop-submit` with `video_ids`, a comma-separated list of `VIDEOID` or `VIDEOID=CAMPAIGN-UUID`, when the clip is scheduled:
 

@@ -1,7 +1,8 @@
 // Offline selftest for run.mjs: every HTTP call goes to a fake fetch, so the real request/parse code runs.
 // Cases: due, not-due, gap, 30-minute-expired, API-refused (YouTube and Content Rewards), duplicate, feed, cap, auth.
 import assert from 'node:assert/strict';
-import { mergeCookies, pass, slot, GAP, mergeLaptop, socialEntry, igPass, net, IG_VERSION, reconcileReceipts, discoverUnregistered, registerHints, checkWatched, parseHints, readVisibility, splitFatals, CHANNEL_MAP } from './run.mjs';
+import { mergeCookies, pass, slot, GAP, mergeLaptop, socialEntry, igPass, net, IG_VERSION, reconcileReceipts, discoverUnregistered, registerHints, checkWatched, parseHints, readVisibility, splitFatals, CHANNEL_MAP, VIDEO_MAP } from './run.mjs';
+import { mergeMap, lookup, formatValue } from './map-edit.mjs';
 import { scan, missesToAlert } from './guard/watchdog.mjs';
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
@@ -270,6 +271,45 @@ await test('joint channel: the title/description rule picks the campaign; no rul
     const r = await run(queue, state);
     assert.ok(r.calls.includes('submit jointPet') && r.calls.includes('submit jointRosb')); assert.ok(!r.calls.includes('submit jointNone'));
   } finally { delete CHANNEL_MAP[JOINT]; feedXml = ''; publicVids = new Set(); }
+});
+
+await test('a per-video override beats the channel default and a monitor row, even when the title does not name it', async () => {
+  feedXml = `<feed><entry><yt:videoId>overrideVid</yt:videoId><title>He stole the Phoenix Egg</title><published>${new Date(now - 60000).toISOString()}</published></entry></feed>`;
+  publicVids = new Set(['overrideVid']);
+  CHANNEL_MAP.UCx = 'camp-pet';
+  VIDEO_MAP.overrideVid = 'camp-rosb';
+  const realSubmit = net.submit, sent = {};
+  net.submit = async (vid, campaign, url) => { sent[vid] = campaign; return realSubmit(vid, campaign, url); };
+  try {
+    const state = {}, queue = {}, io = { fatal: [], log() {}, save() {} };
+    await discoverUnregistered(queue, state, now, io);
+    assert.equal(state.overrideVid.campaign, 'camp-rosb');
+    const monitored = { overrideVid: { campaign: 'camp-pet', at: '2026-10-01 11:50', source_channel: 'UCx', mode: 'monitor' } };
+    const monState = {};
+    await run(monitored, monState);
+    assert.equal(sent.overrideVid, 'camp-rosb');
+    assert.equal(monState.overrideVid.campaign, 'camp-rosb');
+  } finally { delete CHANNEL_MAP.UCx; delete VIDEO_MAP.overrideVid; net.submit = realSubmit; feedXml = ''; publicVids = new Set(); }
+});
+
+await test('same-day public upload on a tokenless mapped channel is submitted without a pre-scheduled queue row', async () => {
+  const recent = new Date(now - 60000).toISOString();
+  const old = new Date(now - 3 * 864e5).toISOString();
+  feedXml = `<feed><entry><yt:videoId>sameDay1111</yt:videoId><published>${recent}</published></entry><entry><yt:videoId>oldUpload11</yt:videoId><published>${old}</published></entry></feed>`;
+  publicVids = new Set(['sameDay1111', 'oldUpload11']);
+  CHANNEL_MAP.UCmissing = 'camp-mapped';
+  try {
+    const state = {}, queue = {}, io = { fatal: [], log() {}, save() {} };
+    await discoverUnregistered(queue, state, now, io);
+    assert.equal(state.sameDay1111.campaign, 'camp-mapped');
+    assert.equal(state.sameDay1111.source_channel, 'UCmissing');
+    assert.equal(state.oldUpload11, undefined);
+    const r = await run(queue, state);
+    assert.ok(r.calls.includes('submit sameDay1111'));
+    assert.ok(!r.calls.includes('submit oldUpload11'));
+    assert.ok(!r.calls.some(c => c.startsWith('publish')));
+    assert.equal(splitFatals(r.fatal).hard.length, 0, r.fatal.join(' | '));
+  } finally { delete CHANNEL_MAP.UCmissing; feedXml = ''; publicVids = new Set(); }
 });
 
 await test('instant-submit hint: public video on a mapped channel submits this run; unmapped is refused; private is watched', async () => {
@@ -1090,6 +1130,36 @@ await test('SKIP_OLD_MISSES_BEFORE drops burned repost ids and keeps new misses'
   const cut = new Date(now - 60 * 60e3).toISOString();
   assert.deepEqual(missesToAlert(r.misses, [], cut).map(x => x.vid).sort(), ['newMiss', 'stillDue']);
   assert.deepEqual(missesToAlert(r.misses, r.repost, 'not-a-date').map(x => x.vid), ['stillDue']);
+});
+
+await test('watchdog counts a public mapped clip that is not a queue row and ignores a private watch', async () => {
+  const state = {
+    sameDay1111: { campaign: CAMP, source_channel: 'UCmissing', unmapped_public_at: new Date(now - 10 * 60e3).toISOString() },
+    stillPriv11: { campaign: CAMP, watch: new Date(now).toISOString() },
+    _ytquota: { at: new Date(now).toISOString() },
+  };
+  const r = await scan({}, state, now, async vid => vid === 'sameDay1111');
+  assert.deepEqual(r.submitNow.map(x => x.vid), ['sameDay1111']);
+  assert.deepEqual(r.repost, []);
+  assert.deepEqual(r.misses, []);
+});
+
+await test('map override adds channels and a video, and refuses to remap or drop', async () => {
+  const keep = 'UC' + 'a'.repeat(22), add = 'UC' + 'b'.repeat(22), vid = 'abcdefghijk';
+  const camp = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', other = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+  const data = { channels: { [keep]: camp }, extra: true };
+  const { data: next, set } = mergeMap(data, { channels: { [add]: other }, videos: { [vid]: other } });
+  assert.equal(set, 2);
+  assert.equal(next.channels[keep], camp);
+  assert.equal(next.channels[add], other);
+  assert.equal(next.videos[vid], other);
+  assert.equal(next.extra, true);
+  assert.equal(mergeMap(next, { channels: { [add]: other } }).set, 0);
+  assert.throws(() => mergeMap(next, { channels: { [keep]: other } }), /refusing to remap/);
+  assert.equal(lookup(next, `${vid}@${keep}`), other);
+  assert.equal(lookup(next, keep), camp);
+  assert.equal(formatValue({ 'pet ?sim': camp, rosandbox: other }), `JOINT ${camp},${other}`);
+  assert.equal(formatValue(null), 'UNMAPPED');
 });
 
 console.log(`selftest ok: ${cases} cases`);

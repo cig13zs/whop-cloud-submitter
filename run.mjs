@@ -27,10 +27,12 @@ export const tag = vid => 'h' + createHash('sha256').update(String(vid).replace(
 export const TT_WINDOW = 3 * 3600e3;
 export const GAP = 5 * 60e3;       // min time between two publishes on one channel ("just uplaod everything now", 2026-09-30)
 const DEFAULTS = { UC1xCBrygVPEwmmzLxSN_zNg: '86842687-ba2b-4638-a024-995dcf3d25a3' }; // Charisma Tape -> Sartain, feed backstop
-// channel-map.json {"channels": {"<UC id>": "<campaign id>"}}: one campaign per channel (2026-11-11). Clips can be
-// posted outside queue.json; every public upload on a mapped channel is submitted under its campaign inside the
-// 30-min window (feed backstop below), and the map beats queue-history ambiguity.
+// channel-map.json {"channels": {"<UC id>": "<campaign id>"}, "videos": {"<video id>": "<campaign id>"}}.
+// One campaign per channel (2026-11-11). Clips can be posted outside queue.json; every public upload on a mapped
+// channel from the last 24h (including one uploaded and made public the same day, with no queue row) is submitted
+// under its campaign inside the 30-min window. A videos entry wins over the channel, a monitor row, and a joint rule.
 export const CHANNEL_MAP = {};
+export const VIDEO_MAP = {};
 // A channel-map.json value is one campaign id, or for a JOINT channel { "<regex>": "<campaign id>", ... }: the first
 // regex (case-insensitive) that hits the video's title + description picks the campaign. No hit = campaign unknown.
 export const campaignFor = (channel, text = '') => {
@@ -394,7 +396,7 @@ export async function registerHints(ids, queue, state, now, io) {
       }
       let channel, text = '';
       try { ({ channel, text } = await net.videoChannel(vid)); } catch (e) { if (!given) throw e; } // the channel is only needed to pick a campaign
-      const campaign = given || (rec?.watch && rec.campaign) || (CHANNEL_MAP[channel] && campaignFor(channel, text));
+      const campaign = given || (rec?.watch && rec.campaign) || VIDEO_MAP[vid] || (CHANNEL_MAP[channel] && campaignFor(channel, text));
       if (!campaign) {
         io.log(`hint ${tag(vid)}: channel ${channel ? tag(channel) : 'unknown'} is not in channel-map.json, or no joint rule matched; skipped`);
         io.fatal.push(`REGISTER-REJECTED ${tag(vid)}: public, no campaign given and its channel has no map rule; send VIDEOID=CAMPAIGN-UUID`);
@@ -423,7 +425,7 @@ export async function checkWatched(queue, state, now, io) {
       if (!await net.oembedPublic(vid)) { waiting++; return; }
       let channel, text = '';
       try { ({ channel, text } = await net.videoChannel(vid)); } catch (e) { if (!rec.campaign) throw e; }
-      const campaign = rec.campaign || (CHANNEL_MAP[channel] && campaignFor(channel, text));
+      const campaign = rec.campaign || VIDEO_MAP[vid] || (CHANNEL_MAP[channel] && campaignFor(channel, text));
       if (!campaign) { // stays watched: re-registering it as VIDEOID=CAMPAIGN inside the window still submits it
         if (!rec.watch_alert) { rec.watch_alert = iso(now); n++; io.fatal.push(`PUBLIC-UNSUBMITTED ${vid} [${tag(vid)}]: registered without a campaign and its channel has no map rule; re-register it as VIDEOID=CAMPAIGN-UUID`); }
         return;
@@ -446,8 +448,10 @@ export async function discoverUnregistered(queue, state, now, io) {
       for (const [vid, at, text] of await net.feed(channel)) {
         // A watched (registered, still private per oEmbed) video belongs to checkWatched and its registered campaign.
         if (queue[vid] || state[vid]?.submitted || state[vid]?.unmapped_public_at || state[vid]?.watch || now < at || now - at > 24 * 3600e3) continue;
-        // Exactly one campaign on this channel -> submit under it (see candidates). Zero or several: ambiguous, soft.
-        const campaigns = CHANNEL_MAP[channel] ? [campaignFor(channel, text)].filter(Boolean)
+        // A per-video override wins. Otherwise exactly one campaign on this channel -> submit under it.
+        // Zero or several: ambiguous, soft. Same-day public uploads are inside the 24h window above.
+        const campaigns = VIDEO_MAP[vid] ? [VIDEO_MAP[vid]]
+          : CHANNEL_MAP[channel] ? [campaignFor(channel, text)].filter(Boolean)
           : [...new Set([...Object.values(queue).filter(q => (q.channel || q.source_channel) === channel).map(q => q.campaign), DEFAULTS[channel]].filter(Boolean))];
         if (process.env.GITHUB_ACTIONS) console.log(`::add-mask::${vid}`); // public log: ids found after the start-up mask
         state[vid] = { ...state[vid], source_channel: channel, unmapped_public_at: iso(at), coverage_alert: iso(now), ...(campaigns.length === 1 ? { campaign: campaigns[0] } : {}) };
@@ -611,7 +615,7 @@ export async function candidates(queue, state, now, io) {
   for (const channel of Object.keys({ ...DEFAULTS, ...CHANNEL_MAP })) {
     // A registered video keeps the campaign it was registered with; the map only decides for the rest.
     const registered = vid => (state[vid]?.watch || state[vid]?.unmapped_public_at) && state[vid].campaign;
-    try { for (const [vid, t, text] of await net.feed(channel)) { const campaign = registered(vid) || campaignFor(channel, text); if (campaign && now - t <= WINDOW) out.set(vid, [campaign, t]); } }
+    try { for (const [vid, t, text] of await net.feed(channel)) { const campaign = registered(vid) || VIDEO_MAP[vid] || campaignFor(channel, text); if (campaign && now - t <= WINDOW) out.set(vid, [campaign, t]); } }
     catch { /* discoverUnregistered already logged the feed outage once; a feed hiccup mustn't stop the queued videos */ }
   }
   const pub = vid => state[vid]?.published || queue[vid].published;
@@ -660,10 +664,12 @@ export async function candidates(queue, state, now, io) {
         if (q.campaign && now - since <= PUBLIC_SUBMIT_WINDOW && !rec.submission_terminal) {
           // Already public with a campaign and still inside the window: submit it (never republish). A failed attempt
           // is retried next run until the window closes, then hard-fails below.
+          const campaign = VIDEO_MAP[vid] || q.campaign;
+          rec.campaign = campaign;
           rec.published ??= iso(since);
           io.save();
           io.log(`monitored clip ${vid} is public (${Math.floor((now - since) / 60e3)} min); submitting, never republishing`);
-          out.set(vid, [q.campaign, since]);
+          out.set(vid, [campaign, since]);
           continue;
         }
         rec.coverage_alert = iso(now);
@@ -956,9 +962,17 @@ export function mergeLaptop(state, laptop) {
 async function main() {
   const dry = process.argv.includes('--dry-run');
   const queue = load('queue.json'), state = mergeLaptop(load('state.json'), existsSync(path.join(DIR, 'laptop-state.json')) ? load('laptop-state.json') : {});
-  if (existsSync(path.join(DIR, 'channel-map.json'))) Object.assign(CHANNEL_MAP, load('channel-map.json').channels || {});
+  if (existsSync(path.join(DIR, 'channel-map.json'))) {
+    const map = load('channel-map.json');
+    Object.assign(CHANNEL_MAP, map.channels || {});
+    Object.assign(VIDEO_MAP, map.videos || {});
+  }
   // Public repo: Actions logs are public too, so mask every clip, campaign, channel and post id before anything prints.
-  if (process.env.GITHUB_ACTIONS) for (const [c, v] of Object.entries(CHANNEL_MAP)) for (const k of [c, ...(typeof v === 'string' ? [v] : Object.values(v))]) console.log(`::add-mask::${k}`);
+  if (process.env.GITHUB_ACTIONS) {
+    const mask = k => { if (k && String(k).length > 5) console.log(`::add-mask::${k}`); };
+    for (const [c, v] of Object.entries(CHANNEL_MAP)) { mask(c); for (const x of (typeof v === 'string' ? [v] : Object.values(v))) mask(x); }
+    for (const [vid, camp] of Object.entries(VIDEO_MAP)) { mask(vid); mask(camp); }
+  }
   if (process.env.GITHUB_ACTIONS)
     for (const [vid, q] of [...Object.entries(queue), ...Object.entries(state)])
       for (const v of [vid, vid.replace(/^\w+:/, ''), q.campaign, q.channel, q.source_channel, q.url, q.permalink]) if (v && String(v).length > 5) console.log(`::add-mask::${v}`);
