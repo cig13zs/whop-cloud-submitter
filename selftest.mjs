@@ -1,7 +1,7 @@
 // Offline selftest for run.mjs: every HTTP call goes to a fake fetch, so the real request/parse code runs.
 // Cases: due, not-due, gap, 30-minute-expired, API-refused (YouTube and Content Rewards), duplicate, feed, cap, auth.
 import assert from 'node:assert/strict';
-import { mergeCookies, pass, slot, GAP, mergeLaptop, socialEntry, igPass, net, IG_VERSION, reconcileReceipts, discoverUnregistered, registerHints, readVisibility, splitFatals, CHANNEL_MAP } from './run.mjs';
+import { mergeCookies, pass, slot, GAP, mergeLaptop, socialEntry, igPass, net, IG_VERSION, reconcileReceipts, discoverUnregistered, registerHints, checkWatched, parseHints, readVisibility, splitFatals, CHANNEL_MAP } from './run.mjs';
 import { scan, missesToAlert } from './guard/watchdog.mjs';
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
@@ -12,7 +12,7 @@ const now = slot('2026-10-01 12:00');
 const calls = [];
 let session = 'ok', checks = 0, feedXml = '', publicVids = new Set(), crResult = {}, ytPutFail = new Set(), campaignStatus = {};
 const publishedDates = new Map();
-let videoReads = 0, quotaFailed = false, missingVideos = new Set();
+let videoReads = 0, quotaFailed = false, missingVideos = new Set(), feedStatus = 200;
 const tokenCalls = {}, tokenScript = {};
 process.env.WHOP_CR_COOKIE = '__Host-cr-session=fake; __Host-cr-whop-id=fake';
 process.env.YT_CLIENT = JSON.stringify({ client_id: 'id', client_secret: 'sec' });
@@ -22,7 +22,7 @@ const json = (body, status = 200, headers = {}) => new Response(JSON.stringify(b
 globalThis.fetch = async (url, opt = {}) => {
   url = String(url);
   const method = opt.method || 'GET';
-  if (url.includes('/feeds/videos.xml')) return new Response(feedXml);
+  if (url.includes('/feeds/videos.xml')) return new Response(feedXml, { status: feedStatus });
   if (url.includes('tiktok.com/oembed')) return new Response('{}', { status: publicVids.has('tt:' + decodeURIComponent(url).split('/video/')[1]) ? 200 : 400 });
   if (url.includes('/oembed')) {
     const page = decodeURIComponent(url.split('url=')[1] || '');
@@ -272,21 +272,74 @@ await test('joint channel: the title/description rule picks the campaign; no rul
   } finally { delete CHANNEL_MAP[JOINT]; feedXml = ''; publicVids = new Set(); }
 });
 
-await test('instant-submit hint: public video on a mapped channel submits this run; unmapped or private is skipped', async () => {
+await test('instant-submit hint: public video on a mapped channel submits this run; unmapped is refused; private is watched', async () => {
   publicVids = new Set(['hintMapped', 'hintOther']);
   CHANNEL_MAP.UCx = 'camp-mapped';
   const realChannel = net.videoChannel;
   net.videoChannel = async vid => ({ channel: vid === 'hintOther' ? 'UCstranger' : 'UCx', text: '' });
   try {
     const state = {}, queue = {}, io = { fatal: [], log() {}, save() {} };
-    assert.equal(await registerHints(['hintMapped', 'hintOther', 'hintPrivat'], queue, state, now, io), 1);
-    assert.equal(state.hintMapped.campaign, 'camp-mapped'); assert.equal(state.hintOther, undefined); assert.equal(state.hintPrivat, undefined);
+    assert.equal(await registerHints(['hintMapped', 'hintOther', 'hintPrivat'], queue, state, now, io), 2);
+    assert.equal(state.hintMapped.campaign, 'camp-mapped'); assert.equal(state.hintOther, undefined);
+    assert.ok(state.hintPrivat.watch); assert.equal(state.hintPrivat.unmapped_public_at, undefined);
+    assert.match(io.fatal.join(' | '), /REGISTER-REJECTED/, 'a public video with no campaign is refused out loud');
     assert.equal(await registerHints(['hintMapped'], queue, state, now, io), 0, 'a second hint for the same id is a no-op');
     const dryState = {};
     assert.equal(await registerHints(['hintMapped'], queue, dryState, now, { ...io, dry: true }), 0, 'dry runs only log');
     const r = await run(queue, state);
     assert.ok(r.calls.includes('submit hintMapped')); assert.ok(state.hintMapped.submitted);
   } finally { delete CHANNEL_MAP.UCx; net.videoChannel = realChannel; publicVids = new Set(); }
+});
+
+await test('registered at schedule time: a private VIDEOID=CAMPAIGN is watched, submits the run it goes public, and beats the channel map', async () => {
+  const GIVEN = '11111111-2222-3333-4444-555555555555', BAD = '99999999-2222-3333-4444-555555555555';
+  assert.deepEqual(parseHints(`regPrivate1=${GIVEN.toUpperCase()}, regNoCamp11 regBad=x short`), [['regPrivate1', GIVEN.toUpperCase()], ['regNoCamp11', undefined], 'regBad=x', 'short']);
+  CHANNEL_MAP.UCx = 'camp-mapped';
+  campaignStatus[BAD] = { broken: true };
+  const realChannel = net.videoChannel, realSubmit = net.submit, sent = {};
+  net.videoChannel = async vid => ({ channel: vid === 'regOrphan11' ? 'UCstranger' : 'UCx', text: '' });
+  net.submit = async (vid, campaign, url) => { sent[vid] = campaign; return realSubmit(vid, campaign, url); };
+  const later = now + 5 * 60000;
+  try {
+    const state = {}, queue = {}, io = { fatal: [], log() {}, save() {} };
+    assert.equal(await registerHints([['regPrivate1', GIVEN.toUpperCase()], ['regBadCamp1', BAD], ['regNoCamp11'], ['regOrphan11'], ['regLater111', GIVEN]], queue, state, now, io), 4);
+    assert.equal(state.regPrivate1.campaign, GIVEN); assert.ok(state.regPrivate1.watch); assert.equal(state.regNoCamp11.campaign, undefined);
+    assert.equal(state.regBadCamp1, undefined, 'an unknown campaign id is refused at registration');
+    assert.match(io.fatal.join(' | '), /REGISTER-REJECTED/); assert.equal(splitFatals(io.fatal).hard.length, 1, 'a refused registration turns the run red');
+    assert.equal(await registerHints([['regPrivate1', GIVEN]], queue, state, now, io), 0, 'registering again is a no-op');
+    assert.equal(await checkWatched(queue, state, now, io), 0, 'nothing is public yet');
+    assert.equal((await run(queue, state)).calls.length, 0);
+    // The feed lists a watched video while oEmbed still says private: the feed path leaves it to checkWatched.
+    feedXml = `<feed><entry><yt:videoId>regLater111</yt:videoId><published>${new Date(now - 60000).toISOString()}</published></entry></feed>`;
+    await discoverUnregistered(queue, state, now, io);
+    assert.equal(state.regLater111.unmapped_public_at, undefined);
+    // Go-live. The feed also shows regPrivate1 on a mapped channel, where the map says camp-mapped.
+    publicVids = new Set(['regPrivate1', 'regNoCamp11', 'regOrphan11']);
+    feedXml = `<feed><entry><yt:videoId>regPrivate1</yt:videoId><published>${new Date(later - 60000).toISOString()}</published></entry></feed>`;
+    io.fatal.length = 0;
+    assert.equal(await checkWatched(queue, state, later, io), 3);
+    assert.equal(state.regNoCamp11.campaign, 'camp-mapped', 'no campaign given: the channel map decides at go-live');
+    assert.match(io.fatal.join(' | '), /PUBLIC-UNSUBMITTED regOrphan11/); assert.equal(state.regOrphan11.unmapped_public_at, undefined);
+    assert.equal(await checkWatched(queue, state, later, io), 0, 'the no-campaign alert fires once');
+    assert.equal(await registerHints([['regOrphan11', GIVEN]], queue, state, later, io), 1, 're-registering with a campaign rescues it');
+    const r = await run(queue, state, later);
+    for (const v of ['regPrivate1', 'regNoCamp11', 'regOrphan11']) { assert.ok(r.calls.includes(`submit ${v}`), v); assert.ok(state[v].submitted); }
+    assert.equal(sent.regPrivate1, GIVEN, 'the registered campaign beats the channel map'); assert.equal(sent.regNoCamp11, 'camp-mapped'); assert.equal(sent.regOrphan11, GIVEN);
+    assert.ok(!r.calls.includes('submit regLater111')); assert.deepEqual(r.fatal, []);
+    // 21 days without going public: the watch is dropped, nothing is submitted.
+    assert.equal(await checkWatched(queue, state, now + 22 * 864e5, io), 1); assert.equal(state.regLater111.watch, undefined);
+  } finally { delete CHANNEL_MAP.UCx; delete campaignStatus[BAD]; net.videoChannel = realChannel; net.submit = realSubmit; feedXml = ''; publicVids = new Set(); }
+});
+
+await test('a dead YouTube feed (HTTP 404) is one warning, not silence, and queued clips still submit', async () => {
+  feedStatus = 404; CHANNEL_MAP.UCx = 'camp-mapped'; publicVids = new Set(['feedDownQ']);
+  try {
+    const logs = [], state = {}, queue = { feedDownQ: { campaign: CAMP, at: '2026-10-01 11:59', channel: 'UCx' } };
+    assert.equal(await discoverUnregistered(queue, state, now, { fatal: [], log: m => logs.push(m), save() {} }), 0);
+    assert.equal(logs.filter(l => /feed unreadable/.test(l)).length, 1);
+    const r = await run(queue, state);
+    assert.ok(r.calls.includes('submit feedDownQ')); assert.deepEqual(r.fatal, []);
+  } finally { feedStatus = 200; delete CHANNEL_MAP.UCx; publicVids = new Set(); }
 });
 
 await test('unregistered public on a single-campaign channel is submitted inside 28 min, hard-fails past it', async () => {

@@ -20,7 +20,17 @@ YouTube Data API quota, or a channel missing from `YT_REFRESH_TOKENS`, does not 
 
 **Channel map (2026-11-11).** Some clips are posted outside `queue.json`. `channel-map.json` (`{"channels": {"<UC id>": "<campaign id>"}}`, sealed as `channel-map.json.enc`, written by the operator only) gives each campaign channel exactly one campaign. Every public upload on a mapped channel is submitted under it inside the 30-minute window, and the map overrides the queue-history ambiguity below. With no map file the runner behaves as before.
 
-Public uploads that are not in `queue.json` are a warning. They stay unregistered (no campaign is inferred). Queued public clips in that same run are still submitted.
+**Registering a clip (2026-11-11).** This is how a clip posted outside `queue.json` reaches the runner. Dispatch `whop-submit` with `video_ids`, a comma-separated list of `VIDEOID` or `VIDEOID=CAMPAIGN-UUID`, when the clip is scheduled:
+
+```bash
+gh workflow run whop-submit -R cig13zs/whop-cloud-submitter -f video_ids=VIDEOID=CAMPAIGN-UUID,VIDEOID2=CAMPAIGN-UUID2
+```
+
+A video that is still private is watched: one oEmbed read per run, and the run that first sees it public submits it. A given campaign beats `channel-map.json`, so a joint channel or a new channel needs no map entry. Without a campaign, the channel map picks one at go-live. Sending the same id again is a no-op; sending it again with a different campaign before the submit replaces the campaign. The run fails (red) when an entry is malformed, when Content Rewards does not know the campaign id, or when a public video has no campaign. A watch is dropped after 21 days. The list is read from the dispatch event file, so campaign ids never print in the public log.
+
+The channel feed is only a backstop for clips nobody registered. On 2026-11-11 YouTube answered 404 for every channel feed, the runner read that as "no new videos", and two go-lives were not seen for more than 22 minutes. A feed outage now logs one warning per run.
+
+Public uploads that are not in `queue.json` and were not registered are a warning. They stay unregistered (no campaign is inferred). Queued public clips in that same run are still submitted.
 
 A queued `mode: monitor` clip is submitted when it is publicly viewable, has a campaign, is at or past its scheduled slot, and is still inside 28 minutes. oEmbed public is enough on a channel with no refresh token. The run never republishes it. A private clip stays unsubmitted because oEmbed is not public, and the scheduled slot blocks an early submit. A public clip that still has no submission when that window closes fails the run (`PUBLIC-UNSUBMITTED`) and is written to `RECONCILE.json`. A paused or capped campaign remains a warning.
 

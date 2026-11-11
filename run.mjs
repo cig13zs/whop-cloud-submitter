@@ -53,7 +53,10 @@ const iso = t => new Date(t).toISOString().replace('.000Z', 'Z');
 
 // ---- YouTube ------------------------------------------------------------------------------------------------------
 export async function feed(channel) {
-  const xml = await (await fetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${channel}`, { headers: { 'user-agent': UA } })).text();
+  const r = await fetch(`https://www.youtube.com/feeds/videos.xml?channel_id=${channel}`, { headers: { 'user-agent': UA } });
+  // 2026-11-11: YouTube answered 404 for every channel's feed. Read as "no new videos", that hid two go-lives for 22+ min.
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const xml = await r.text();
   return xml.split('<entry>').slice(1).map(e => [e.match(/<yt:videoId>([^<]+)/)?.[1], Date.parse(e.match(/<published>([^<]+)/)?.[1]),
     `${e.match(/<title>([^<]*)/)?.[1] || ''} ${e.match(/<media:description>([\s\S]*?)<\/media:description>/)?.[1] || ''}`]).filter(e => e[0] && e[1]);
 }
@@ -362,19 +365,44 @@ export function reconcileReceipts(queue, state, rows) {
   return changed;
 }
 
-// Instant submit (11-11): Grok dispatches whop-submit with video_ids the moment a clip goes public, so the submit
-// doesn't wait 17-23 min for the RSS feed. Only public videos on a channel-map.json channel are taken.
+// Registration (11-11): whop-submit's video_ids input is "VIDEOID" or "VIDEOID=CAMPAIGN-UUID", comma separated.
+// Grok sends it when a clip is SCHEDULED (and again at go-live; repeats are no-ops). A given campaign beats
+// channel-map.json, so a joint channel or a brand-new channel needs no map entry. A video that isn't public yet is
+// watched (checkWatched) and submitted the run it turns public: nothing waits on the RSS feed.
+export const parseHints = s => String(s || '').split(/[\s,]+/).filter(Boolean)
+  .map(t => t.match(/^([\w-]{11})(?:=([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}))?$/i)?.slice(1, 3) || t);
 export async function registerHints(ids, queue, state, now, io) {
   let n = 0;
-  for (const vid of ids) {
-    if (queue[vid] || state[vid]?.submitted || state[vid]?.unmapped_public_at) { io.log(`hint ${tag(vid)}: already tracked`); continue; }
+  for (const entry of ids) {
+    const [vid, given] = Array.isArray(entry) ? [entry[0], entry[1]?.toLowerCase()] : [entry];
+    const rec = state[vid];
+    if (queue[vid] || rec?.submitted || rec?.unmapped_public_at) { io.log(`hint ${tag(vid)}: already tracked`); continue; }
     try {
-      if (!await net.oembedPublic(vid)) { io.log(`hint ${tag(vid)}: not public yet; skipped`); continue; }
-      const { channel, text } = await net.videoChannel(vid), campaign = CHANNEL_MAP[channel] && campaignFor(channel, text);
-      if (!campaign) { io.log(`hint ${tag(vid)}: channel ${channel ? tag(channel) : 'unknown'} is not in channel-map.json, or no joint rule matched; skipped`); continue; }
-      io.log(`hint ${tag(vid)}: public on a mapped channel; submitting this run`);
+      // Check a given campaign now, while a typo can still be fixed. Only a real "no such campaign" answer rejects;
+      // a network blip or 5xx keeps the registration.
+      if (given) {
+        const bad = await net.cap(given).then(() => '', e => /HTTP [1-4]\d\d/.test(e.message) ? e.message : '');
+        if (bad) { io.fatal.push(`REGISTER-REJECTED ${tag(vid)}: Content Rewards does not know that campaign id`); continue; }
+      }
+      if (!await net.oembedPublic(vid)) {
+        if (rec?.watch && (!given || rec.campaign === given)) { io.log(`hint ${tag(vid)}: already watched`); continue; }
+        io.log(`hint ${tag(vid)}: not public yet; watching, ${given ? 'campaign given' : 'campaign from the channel map at go-live'}`);
+        if (io.dry) continue;
+        state[vid] = { ...rec, watch: rec?.watch || iso(now), ...(given ? { campaign: given } : {}) };
+        n++;
+        continue;
+      }
+      let channel, text = '';
+      try { ({ channel, text } = await net.videoChannel(vid)); } catch (e) { if (!given) throw e; } // the channel is only needed to pick a campaign
+      const campaign = given || (rec?.watch && rec.campaign) || (CHANNEL_MAP[channel] && campaignFor(channel, text));
+      if (!campaign) {
+        io.log(`hint ${tag(vid)}: channel ${channel ? tag(channel) : 'unknown'} is not in channel-map.json, or no joint rule matched; skipped`);
+        io.fatal.push(`REGISTER-REJECTED ${tag(vid)}: public, no campaign given and its channel has no map rule; send VIDEOID=CAMPAIGN-UUID`);
+        continue;
+      }
+      io.log(`hint ${tag(vid)}: public, ${given ? 'campaign given' : 'campaign from the channel map'}; submitting this run`);
       if (io.dry) continue;
-      state[vid] = { ...state[vid], source_channel: channel, unmapped_public_at: iso(now), campaign, hinted: iso(now) };
+      state[vid] = { ...rec, source_channel: channel, unmapped_public_at: iso(now), campaign, hinted: iso(now) };
       n++;
     } catch (e) { io.log(`hint ${tag(vid)} failed: ${e.message}`); }
   }
@@ -382,13 +410,42 @@ export async function registerHints(ids, queue, state, now, io) {
   return n;
 }
 
+// Registered videos that were still private: one oEmbed read each per run. The run that first sees one public stamps
+// it, and candidates() submits it in the same run under its registered campaign (else the channel map's).
+// ponytail: every watched id is read every run; add a go-live time to the entry if the list ever passes a few hundred.
+export const WATCH_DAYS = 21;
+export async function checkWatched(queue, state, now, io) {
+  let n = 0, waiting = 0;
+  await Promise.all(Object.entries(state).map(async ([vid, rec]) => {
+    if (!rec.watch || rec.unmapped_public_at || rec.submitted || queue[vid]) return;
+    if (now - Date.parse(rec.watch) > WATCH_DAYS * 864e5) { delete rec.watch; n++; io.log(`watched ${tag(vid)}: still not public after ${WATCH_DAYS} days; dropped`); return; }
+    try {
+      if (!await net.oembedPublic(vid)) { waiting++; return; }
+      let channel, text = '';
+      try { ({ channel, text } = await net.videoChannel(vid)); } catch (e) { if (!rec.campaign) throw e; }
+      const campaign = rec.campaign || (CHANNEL_MAP[channel] && campaignFor(channel, text));
+      if (!campaign) { // stays watched: re-registering it as VIDEOID=CAMPAIGN inside the window still submits it
+        if (!rec.watch_alert) { rec.watch_alert = iso(now); n++; io.fatal.push(`PUBLIC-UNSUBMITTED ${vid} [${tag(vid)}]: registered without a campaign and its channel has no map rule; re-register it as VIDEOID=CAMPAIGN-UUID`); }
+        return;
+      }
+      Object.assign(rec, { source_channel: channel, unmapped_public_at: iso(now), campaign, hinted: iso(now) });
+      n++;
+      io.log(`watched ${tag(vid)}: now public; submitting this run`);
+    } catch (e) { io.log(`watched ${tag(vid)} check failed: ${e.message}`); }
+  }));
+  if (waiting) io.log(`watching ${waiting} registered videos that are not public yet`);
+  if (n) io.save();
+  return n;
+}
+
 export async function discoverUnregistered(queue, state, now, io) {
   const channels = [...new Set([...Object.values(queue).map(q => q.channel || q.source_channel), ...Object.keys(CHANNEL_MAP)].filter(Boolean))];
-  let added = 0, sole = 0;
+  let added = 0, sole = 0, down = 0;
   await Promise.all(channels.map(async channel => {
     try {
       for (const [vid, at, text] of await net.feed(channel)) {
-        if (queue[vid] || state[vid]?.submitted || state[vid]?.unmapped_public_at || now < at || now - at > 24 * 3600e3) continue;
+        // A watched (registered, still private per oEmbed) video belongs to checkWatched and its registered campaign.
+        if (queue[vid] || state[vid]?.submitted || state[vid]?.unmapped_public_at || state[vid]?.watch || now < at || now - at > 24 * 3600e3) continue;
         // Exactly one campaign on this channel -> submit under it (see candidates). Zero or several: ambiguous, soft.
         const campaigns = CHANNEL_MAP[channel] ? [campaignFor(channel, text)].filter(Boolean)
           : [...new Set([...Object.values(queue).filter(q => (q.channel || q.source_channel) === channel).map(q => q.campaign), DEFAULTS[channel]].filter(Boolean))];
@@ -397,8 +454,10 @@ export async function discoverUnregistered(queue, state, now, io) {
         if (campaigns.length === 1) { sole++; continue; }
         added++;
       }
-    } catch (e) { io.log(`upload coverage feed read failed: ${e.message}`); }
+    } catch (e) { if (!down++) io.log(`upload coverage feed read failed: ${e.message}`); }
   }));
+  // One line, not one per channel. Registered videos don't need the feed; unregistered ones are invisible while it is down.
+  if (down) io.log(`WARNING: YouTube channel feed unreadable for ${down} of ${channels.length} channels; only registered videos (video_ids) are seen this run`);
   if (sole) { io.save(); io.log(`detected ${sole} public uploads outside the queue on single-campaign channels; submitting inside ${PUBLIC_SUBMIT_WINDOW / 60e3} min, else PUBLIC-UNSUBMITTED`); }
   if (added) {
     io.save();
@@ -550,8 +609,10 @@ export async function candidates(queue, state, now, io) {
     return status.privacyStatus === 'public';
   };
   for (const channel of Object.keys({ ...DEFAULTS, ...CHANNEL_MAP })) {
-    try { for (const [vid, t, text] of await net.feed(channel)) { const campaign = campaignFor(channel, text); if (campaign && now - t <= WINDOW) out.set(vid, [campaign, t]); } }
-    catch (e) { io.log(`feed ${channel}: ${e.message}`); } // a feed hiccup mustn't stop the queued videos
+    // A registered video keeps the campaign it was registered with; the map only decides for the rest.
+    const registered = vid => (state[vid]?.watch || state[vid]?.unmapped_public_at) && state[vid].campaign;
+    try { for (const [vid, t, text] of await net.feed(channel)) { const campaign = registered(vid) || campaignFor(channel, text); if (campaign && now - t <= WINDOW) out.set(vid, [campaign, t]); } }
+    catch { /* discoverUnregistered already logged the feed outage once; a feed hiccup mustn't stop the queued videos */ }
   }
   const pub = vid => state[vid]?.published || queue[vid].published;
   const last = {}; // latest publish per channel, for GAP: after a long outage held clips go out one per channel per GAP
@@ -901,7 +962,11 @@ async function main() {
   if (process.env.GITHUB_ACTIONS)
     for (const [vid, q] of [...Object.entries(queue), ...Object.entries(state)])
       for (const v of [vid, vid.replace(/^\w+:/, ''), q.campaign, q.channel, q.source_channel, q.url, q.permalink]) if (v && String(v).length > 5) console.log(`::add-mask::${v}`);
-  if (process.env.GITHUB_ACTIONS) for (const v of (process.env.VIDEO_IDS || '').split(/[\s,]+/)) if (v.length > 5) console.log(`::add-mask::${v}`);
+  // video_ids is read from the dispatch event file, not from the step's env: Actions prints a step's env block in this
+  // public log before any mask exists. VIDEO_IDS stays as the local/test way in.
+  let dispatched = process.env.VIDEO_IDS || '';
+  try { dispatched ||= JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')).inputs?.video_ids || ''; } catch { /* not a dispatch */ }
+  if (process.env.GITHUB_ACTIONS) for (const v of dispatched.split(/[\s,=]+/)) if (v.length > 5) console.log(`::add-mask::${v}`);
   // STATE_OUT: a laptop run (refresh-session.mjs --local) saves to laptop-state.json, so each file keeps one writer.
   const io = { dry, log: m => console.log(`${new Date().toISOString().slice(0, 19)}Z ${m}`), fatal: [],
     save: () => dry || writeFileSync(path.join(DIR, process.env.STATE_OUT || 'state.json'), JSON.stringify(state, null, 1) + '\n') };
@@ -916,8 +981,11 @@ async function main() {
     io.whop = 'receipt reconciliation unavailable';
     if (!dry) { process.exitCode = 1; return; }
   }
-  const hints = (process.env.VIDEO_IDS || '').split(/[\s,]+/).filter(v => /^[\w-]{11}$/.test(v));
+  const parsed = parseHints(dispatched), hints = parsed.filter(Array.isArray);
+  // A malformed entry fails the run (red, emailed): a silently dropped registration is a missed submit later.
+  if (parsed.length > hints.length) io.fatal.push(`REGISTER-REJECTED: ${parsed.length - hints.length} malformed video_ids entries (want VIDEOID or VIDEOID=CAMPAIGN-UUID)`);
   if (hints.length) await registerHints(hints, queue, state, Date.now(), io);
+  if (!dry) await checkWatched(queue, state, Date.now(), io);
   if (!dry) await discoverUnregistered(queue, state, Date.now(), io);
   if (dry) {
     io.log(`whop session: ${await whopCheck()}`);
