@@ -22,9 +22,9 @@ const FILE = path.join(DIR, 'uploads.json');
 const RELEASE = 'yt-media';
 const UPLOAD = 'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status';
 const YT = 'https://www.googleapis.com/youtube/v3/';
-// Budget: videos.insert costs 1,600 of the project's 10,000 daily units and run.mjs reads from the same
-// project, so 4 uploads per Pacific day. Raise PER_DAY once the audit grants more quota.
-const PER_DAY = Number(process.env.UPLOADS_PER_DAY || 4);
+// Budget: videos.insert has its own default bucket of 100 calls a day, apart from the 10,000 units the reads
+// use (Google's quota guide, updated 2026-11-12). 20 a Pacific day matches our ~20 clips a day.
+const PER_DAY = Number(process.env.UPLOADS_PER_DAY || 20);
 const MIN_LEAD_MS = 20 * 60e3; // YouTube rejects a publishAt in the past; don't race one that is minutes away
 const LOCK_AFTER_MS = 15 * 60e3;
 
@@ -155,7 +155,7 @@ async function selftest() {
   assert(by('soon').state === 'uploaded', 'inside the 15 min grace it is left alone');
 
   // daily budget, quota stop, retries
-  const many = Array.from({ length: 6 }, (_, i) => ({ slug: 'c', channel: 'UC1', title: `C${i}`, publishAt: iso(5 + i), state: 'staged' }));
+  const many = Array.from({ length: PER_DAY + 2 }, (_, i) => ({ slug: 'c', channel: 'UC1', title: `C${i}`, publishAt: iso(5 + i), state: 'staged' }));
   sent.length = 0;
   await pass(many, { now, io });
   assert(sent.length === PER_DAY, `stops at ${PER_DAY} uploads per Pacific day`);
