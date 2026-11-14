@@ -106,7 +106,7 @@ const access = {};
 const publicTimes = {};
 // A revoked refresh token is invalid_grant (HTTP 400). Do not treat that as a blip.
 const YT_AUTH_ERROR = /invalid_grant|invalid_client|unauthorized_client|access_denied|invalid_token|deleted_client/;
-async function ytToken(channel) {
+export async function ytToken(channel) {
   if (access[channel]) return access[channel];
   const client = JSON.parse(process.env.YT_CLIENT || '{}');
   const refresh = JSON.parse(process.env.YT_REFRESH_TOKENS || '{}')[channel];

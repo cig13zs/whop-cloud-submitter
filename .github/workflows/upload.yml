@@ -1,0 +1,53 @@
+name: yt-upload
+on:
+  schedule:
+    # Every 30 min. Staged clips are days ahead, so a dropped cron costs nothing; the 20 min lead guard catches the rest.
+    - cron: '8,38 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Decrypt and print the plan; upload nothing'
+        type: boolean
+        default: false
+concurrency:
+  group: yt-upload
+  cancel-in-progress: false
+permissions:
+  contents: write
+jobs:
+  upload:
+    # Off until the YouTube API audit passes: Google locks unaudited uploads private (repo variable UPLOAD_ON).
+    if: github.event_name == 'workflow_dispatch' || vars.UPLOAD_ON == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, pinned: this runner holds the secrets
+        with:
+          ref: ${{ github.ref }}
+      - name: Decrypt uploads.json
+        run: node crypt.mjs open
+        env:
+          DATA_KEY: ${{ secrets.DATA_KEY }}
+      - name: Upload staged clips
+        run: node upload.mjs ${{ inputs.dry_run && '--dry-run' || '' }}
+        env:
+          DATA_KEY: ${{ secrets.DATA_KEY }}
+          YT_CLIENT: ${{ secrets.YT_CLIENT }}
+          YT_REFRESH_TOKENS: ${{ secrets.YT_REFRESH_TOKENS }}
+          GH_TOKEN: ${{ github.token }}
+          UPLOADS_PER_DAY: ${{ vars.UPLOADS_PER_DAY }}
+      - name: Commit uploads.json.enc
+        if: always() && !inputs.dry_run
+        env:
+          DATA_KEY: ${{ secrets.DATA_KEY }}
+        run: |
+          [ -f uploads.json ] || exit 0
+          node crypt.mjs seal uploads.json
+          git add -- uploads.json.enc
+          if git diff --cached --name-only --diff-filter=A | grep -E '\.json$'; then echo "refusing to commit plaintext json"; exit 1; fi
+          git diff --cached --quiet && exit 0
+          git config user.name whop-cloud
+          git config user.email whop-cloud@users.noreply.github.com
+          git commit -q -m "uploads $(date -u +%FT%TZ)"
+          for i in 1 2 3; do git pull -q --rebase && git push -q && exit 0; sleep 5; done
+          exit 1

@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
-export const DATA = ['queue.json', 'state.json', 'laptop-state.json', 'channel-map.json', 'register-key.json'];
+export const DATA = ['queue.json', 'state.json', 'laptop-state.json', 'channel-map.json', 'register-key.json', 'uploads.json'];
 const KEY_FILE = process.env.WHOP_KEY_FILE || path.join(homedir(), '.claude', 'keys', 'whop-runner-data.key');
 let k;
 const key = () => k ??= Buffer.from(process.env.DATA_KEY || readFileSync(KEY_FILE, 'utf8').trim(), 'base64');
@@ -28,6 +28,19 @@ export function open(b64) {
   const d = createDecipheriv('aes-256-gcm', key(), b.subarray(0, 12));
   d.setAuthTag(b.subarray(12, 28));
   return Buffer.concat([d.update(b.subarray(28)), d.final()]).toString('utf8');
+}
+
+// Binary form for clip files (upload.mjs / stage.mjs): iv | tag | body, no base64 bloat.
+export function sealBytes(buf) {
+  const iv = randomBytes(12), c = createCipheriv('aes-256-gcm', key(), iv);
+  const body = Buffer.concat([c.update(buf), c.final()]);
+  return Buffer.concat([iv, c.getAuthTag(), body]);
+}
+
+export function openBytes(b) {
+  const d = createDecipheriv('aes-256-gcm', key(), b.subarray(0, 12));
+  d.setAuthTag(b.subarray(12, 28));
+  return Buffer.concat([d.update(b.subarray(28)), d.final()]);
 }
 
 function main([cmd, ...files]) {

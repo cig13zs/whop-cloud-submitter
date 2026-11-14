@@ -6,7 +6,7 @@
 //   with_locks.ps1 -Owner refresh-session -Locks cr -NodeArgs refresh-session.mjs   # Whop session + YouTube
 //   node refresh-session.mjs --yt                                                   # YouTube only, no browser
 //   ... refresh-session.mjs --check   # whop_watch.py fallback: renew + check the session, print {"whop":"ok"}, set nothing
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
@@ -62,7 +62,9 @@ async function whop() {
 function youtube() {
   const { client_id, client_secret } = JSON.parse(readFileSync(`${KEYS}/youtube-oauth-client.json`, 'utf8')).installed;
   setSecret('YT_CLIENT', JSON.stringify({ client_id, client_secret }));
-  const channels = [...new Set(Object.values(JSON.parse(readFileSync(path.join(DIR, 'queue.json'), 'utf8'))).map(q => q.channel).filter(Boolean))];
+  // queue channels (submitter) + uploads.json channels (cloud uploader, upload.mjs)
+  const uploads = existsSync(path.join(DIR, 'uploads.json')) ? JSON.parse(readFileSync(path.join(DIR, 'uploads.json'), 'utf8')) : [];
+  const channels = [...new Set([...Object.values(JSON.parse(readFileSync(path.join(DIR, 'queue.json'), 'utf8'))), ...uploads].map(q => q.channel).filter(Boolean))];
   const tokens = {};
   for (const ch of channels) {
     const t = JSON.parse(readFileSync(`${KEYS}/yt-tokens/${ch}.json`, 'utf8'));
