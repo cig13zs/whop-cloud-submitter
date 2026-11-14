@@ -1,5 +1,8 @@
 # cloud-submitter
 
+**Creator upload scheduler**: a private tool for my own YouTube channels. It uses YouTube API Services.
+[Privacy policy](PRIVACY.md) · [Terms of use](TERMS.md) · Uploader: [upload.mjs](upload.mjs) (cloud), [stage.mjs](stage.mjs) (laptop)
+
 Publishes held campaign clips on YouTube at their slot and submits them to Content Rewards within 30 minutes, from
 GitHub Actions, so it keeps working after the laptop is shut down for school. Cloud Actions is the only submit path; the laptop watcher is not required.
 It runs the same rules as
