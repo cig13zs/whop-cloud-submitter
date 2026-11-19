@@ -1,7 +1,7 @@
 // Offline selftest for run.mjs: every HTTP call goes to a fake fetch, so the real request/parse code runs.
 // Cases: due, not-due, gap, 30-minute-expired, API-refused (YouTube and Content Rewards), duplicate, feed, cap, auth.
 import assert from 'node:assert/strict';
-import { mergeCookies, pass, slot, GAP, mergeLaptop, socialEntry, igPass, net, IG_VERSION, reconcileReceipts, discoverUnregistered, registerHints, checkWatched, parseHints, registerFromFiles, ackText, readVisibility, splitFatals, CHANNEL_MAP, VIDEO_MAP } from './run.mjs';
+import { mergeCookies, pass, slot, GAP, mergeLaptop, socialEntry, igPass, net, IG_VERSION, reconcileReceipts, discoverUnregistered, registerHints, checkWatched, parseHints, registerFromFiles, ackText, readVisibility, splitFatals, readReceiptsRetry, CHANNEL_MAP, VIDEO_MAP } from './run.mjs';
 import { mergeMap, lookup, formatValue } from './map-edit.mjs';
 import { scan, missesToAlert } from './guard/watchdog.mjs';
 import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
@@ -1191,6 +1191,14 @@ await test('map override adds channels and a video, and refuses to remap or drop
   assert.equal(lookup(next, keep), camp);
   assert.equal(formatValue({ 'pet ?sim': camp, rosandbox: other }), `JOINT ${camp},${other}`);
   assert.equal(formatValue(null), 'UNMAPPED');
+});
+
+await test('receipt read retries a CR 5xx, aborts on 4xx, and flags a persistent 5xx as transient', async () => {
+  let n = 0; const waits = [];
+  const rows = await readReceiptsRetry(async ms => waits.push(ms), async () => { if (++n < 3) throw new Error('receipt read failed: HTTP 503'); return [1]; });
+  assert.deepEqual(rows, [1]); assert.equal(n, 3); assert.equal(waits.length, 2);
+  await assert.rejects(readReceiptsRetry(async () => {}, async () => { throw new Error('receipt read failed: HTTP 401'); }), e => !e.transient);
+  await assert.rejects(readReceiptsRetry(async () => {}, async () => { throw new Error('receipt read failed: HTTP 503'); }), e => e.transient === true);
 });
 
 console.log(`selftest ok: ${cases} cases`);

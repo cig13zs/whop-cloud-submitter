@@ -326,6 +326,17 @@ export async function submit(vid, campaign, url = `https://www.youtube.com/watch
   return { stage: r.status === 401 || /AUTHORIZED/.test(code) ? 'unauthorized' : 'refused', error: `${code}: ${message}` };
 }
 
+// A CR 5xx or network blip on the receipt read used to abort the whole run (exit 1, nothing published or submitted):
+// 7 runs in a row did nothing on 2026-11-18 17:40-18:10Z. Retry with backoff; only a 4xx (dead session) still aborts.
+export async function readReceiptsRetry(wait = ms => new Promise(r => setTimeout(r, ms)), read = readReceipts) {
+  let last;
+  for (const delay of [0, 4000, 10000, 20000]) {
+    if (delay) await wait(delay);
+    try { return await read(); } catch (e) { last = e; if (!/HTTP 5\d\d|fetch failed|ETIMEDOUT|ECONNRESET|ENOTFOUND/i.test(e.message)) throw e; }
+  }
+  throw Object.assign(last, { transient: true });
+}
+
 export async function readReceipts() {
   const rows = [], seen = new Set();
   let cursor;
@@ -1022,10 +1033,16 @@ async function main() {
   const io = { dry, log: m => console.log(`${new Date().toISOString().slice(0, 19)}Z ${m}`), fatal: [],
     save: () => dry || writeFileSync(path.join(DIR, process.env.STATE_OUT || 'state.json'), JSON.stringify(state, null, 1) + '\n') };
   try {
-    const rows = await readReceipts();
+    let rows;
+    try { rows = await readReceiptsRetry(); } catch (e) {
+      if (!e.transient) throw e;
+      // Still 5xx after retries: submit anyway. Receipts only dedupe; CR answers a repeat with CONFLICT duplicate-post.
+      io.log(`${e.message}: receipts unreadable after retries; continuing without reconciliation (a duplicate submit is refused by CR)`);
+      rows = []; io.receiptsDegraded = true;
+    }
     io.receiptByVid = new Map(rows.filter(r => r.socialMediaPost?.postId).map(r => [r.socialMediaPost.postId, r]));
-    if (!dry) { const n = reconcileReceipts(queue, state, rows); if (n) { io.save(); io.log(`reconciled ${n} existing submission receipts`); } }
-    else io.log(`receipt reconciliation readable: ${rows.length} records`);
+    if (!dry && !io.receiptsDegraded) { const n = reconcileReceipts(queue, state, rows); if (n) { io.save(); io.log(`reconciled ${n} existing submission receipts`); } }
+    else if (!io.receiptsDegraded) io.log(`receipt reconciliation readable: ${rows.length} records`);
   } catch (e) {
     io.log(e.message);
     io.fatal.push('receipt reconciliation unavailable; holding new publications');
