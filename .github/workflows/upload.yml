@@ -36,14 +36,14 @@ jobs:
           YT_REFRESH_TOKENS: ${{ secrets.YT_REFRESH_TOKENS }}
           GH_TOKEN: ${{ github.token }}
           UPLOADS_PER_DAY: ${{ vars.UPLOADS_PER_DAY }}
-      - name: Commit uploads.json.enc
+      - name: Commit uploads.json.enc + register/ lines
         if: always() && !inputs.dry_run
         env:
           DATA_KEY: ${{ secrets.DATA_KEY }}
         run: |
           [ -f uploads.json ] || exit 0
           node crypt.mjs seal uploads.json
-          git add -- uploads.json.enc
+          git add -- uploads.json.enc register/
           if git diff --cached --name-only --diff-filter=A | grep -E '\.json$'; then echo "refusing to commit plaintext json"; exit 1; fi
           git diff --cached --quiet && exit 0
           git config user.name whop-cloud

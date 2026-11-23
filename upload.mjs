@@ -10,8 +10,9 @@
 //
 //   node upload.mjs [--dry-run]   one pass (needs YT_CLIENT, YT_REFRESH_TOKENS, DATA_KEY, GH_TOKEN)
 //   node upload.mjs selftest      offline test with a fake YouTube
-import { readFileSync, writeFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { publicEncrypt } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -71,6 +72,15 @@ export async function pass(rows, { now = Date.now(), io, dry = false }) {
       else log.push(`${r.slug} attempt ${r.attempts} failed: ${e.message}`);
     }
   }
+
+  // 3) Register VIDEOID=CAMPAIGN (register/*.txt) so the runner watches the private video and submits it the run it
+  // goes public. 11-23: without this a cloud upload on a channel with no map rule went public and was never submitted.
+  for (const r of rows.filter(r => r.video_id && r.campaign && !r.registered)) {
+    if (dry) { log.push(`DRY register ${r.slug}`); continue; }
+    if (!/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(r.campaign)) { fatal.push(`${r.slug}: campaign "${r.campaign}" is not a full CR campaign UUID; register it by hand`); continue; }
+    try { io.register(r.video_id, r.campaign); r.registered = new Date(now).toISOString(); log.push(`${r.slug} registered for submit at go-live`); }
+    catch (e) { fatal.push(`${r.slug}: registration failed (${e.message}); it will NOT be submitted unless registered`); }
+  }
   return { log, fatal };
 }
 
@@ -92,6 +102,12 @@ export const realIO = {
     finally { rmSync(tmp, { recursive: true, force: true }); }
   },
   deleteAsset: asset => gh(['delete-asset', RELEASE, asset, '-y']),
+  // One new register/ file per pass (README: add files, never edit old ones); upload.yml commits it.
+  register(vid, campaign) {
+    const line = publicEncrypt({ key: readFileSync(path.join(DIR, 'register.pub')), oaepHash: 'sha256' }, Buffer.from(`${vid}=${campaign}`)).toString('base64');
+    this.regFile ||= path.join(DIR, 'register', `cloud-upload-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`);
+    appendFileSync(this.regFile, line + '\n');
+  },
   async insert(channel, body, bytes) {
     const init = await ytFetch(channel, UPLOAD, { method: 'POST', body: JSON.stringify(body), headers: {
       'content-type': 'application/json; charset=UTF-8', 'x-upload-content-type': 'video/mp4', 'x-upload-content-length': String(bytes.length) } });
@@ -131,11 +147,15 @@ async function selftest() {
     deleteAsset: n => deleted.push(n),
     insert: async (ch, body, bytes) => { sent.push({ ch, body, bytes }); return { id: `vid${sent.length}`, status: { publishAt: body.status.publishAt } }; },
     status: async (ch, id) => ({ privacyStatus: id === 'old1' ? 'public' : 'private' }),
+    register: (vid, campaign) => regs.push(`${vid}=${campaign}`),
   };
+  const regs = [];
+  const CAMP = 'de2b2ee3-bb22-453e-ae1a-c07bf89c5ef4';
   const iso = h => new Date(now + h * 3600e3).toISOString();
   const rows = [
     { slug: 'b', channel: 'UC1', title: 'B', publishAt: iso(12), state: 'staged' },
-    { slug: 'a', channel: 'UC1', title: 'A', publishAt: iso(6), state: 'staged' },
+    { slug: 'a', channel: 'UC1', title: 'A', publishAt: iso(6), state: 'staged', campaign: CAMP },
+    { slug: 'pre', channel: 'UC1', state: 'uploaded', video_id: 'pre1', publishAt: iso(3), campaign: 'de2b2ee3' },
     { slug: 'late', channel: 'UC1', title: 'L', publishAt: iso(0.1), state: 'staged' },
     { slug: 'old', channel: 'UC1', state: 'uploaded', video_id: 'old1', publishAt: iso(-1) },
     { slug: 'stuck', channel: 'UC1', state: 'uploaded', video_id: 'stuck1', publishAt: iso(-1) },
@@ -153,6 +173,10 @@ async function selftest() {
   assert(by('old').state === 'live', 'public after publishAt -> live');
   assert(by('stuck').state === 'locked' && fatal.some(f => /audit lock/.test(f)), 'still private after publishAt -> locked + fatal');
   assert(by('soon').state === 'uploaded', 'inside the 15 min grace it is left alone');
+  assert(regs.length === 1 && regs[0] === `vid1=${CAMP}` && by('a').registered, 'an upload with a campaign registers VIDEOID=CAMPAIGN');
+  assert(!by('pre').registered && fatal.some(f => /pre: campaign "de2b2ee3" is not a full/.test(f)), 'a campaign prefix is refused loudly, never registered');
+  await pass(rows, { now, io });
+  assert(regs.length === 1, 'a registered row is not registered again');
 
   // daily budget, quota stop, retries
   const many = Array.from({ length: PER_DAY + 2 }, (_, i) => ({ slug: 'c', channel: 'UC1', title: `C${i}`, publishAt: iso(5 + i), state: 'staged' }));
