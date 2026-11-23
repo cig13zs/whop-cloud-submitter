@@ -67,6 +67,13 @@ function youtube() {
   const channels = [...new Set([...Object.values(JSON.parse(readFileSync(path.join(DIR, 'queue.json'), 'utf8'))), ...uploads].map(q => q.channel).filter(Boolean))];
   const tokens = {};
   for (const ch of channels) {
+    // 11-23: one old queue channel never consented (no token file) blocked every channel's refresh. A queue channel
+    // without a token only loses the private-status read; an uploads.json channel can't upload without one, so it fails.
+    if (!existsSync(`${KEYS}/yt-tokens/${ch}.json`)) {
+      if (uploads.some(u => u.channel === ch)) throw new Error(`${ch}: no YouTube token, and the cloud uploader needs one (node tools/ytapi/auth.mjs ${ch})`);
+      console.log(`${ch}: no token file; skipped (queue channel only)`);
+      continue;
+    }
     const t = JSON.parse(readFileSync(`${KEYS}/yt-tokens/${ch}.json`, 'utf8'));
     const consented = t.consented_at ?? t.obtained_at, age = (Date.now() - consented) / 86_400_000;
     // The OAuth app is In production since 2026-10-07: only tokens consented before that (Testing) lapse after 7 days.
