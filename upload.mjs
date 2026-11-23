@@ -59,6 +59,7 @@ export async function pass(rows, { now = Date.now(), io, dry = false }) {
         status: { privacyStatus: 'private', publishAt: new Date(at).toISOString(), selfDeclaredMadeForKids: false, containsSyntheticMedia: false },
       }, bytes);
       if (!video?.id) throw new Error('no video id in the upload response');
+      if (process.env.GITHUB_ACTIONS) console.log(`::add-mask::${video.id}`); // public log, like run.mjs
       if (Date.parse(video.status?.publishAt) !== at) throw new Error(`publishAt read back ${video.status?.publishAt}, wanted ${r.publishAt}`);
       Object.assign(r, { state: 'uploaded', video_id: video.id, uploaded_at: new Date(now).toISOString(), error: null });
       used++;
