@@ -32,13 +32,13 @@ export const publishAtIso = (date, time) => {
   return new Date(ms).toISOString();
 };
 
-function pullAndOpen() { sh('git', ['pull', '-q', '--rebase']); node(['crypt.mjs', 'open']); }
+function pullAndOpen() { sh('git', ['pull', '-q', '--rebase', '--autostash']); node(['crypt.mjs', 'open']); }
 function sealAndPush(msg) {
   node(['crypt.mjs', 'seal', 'uploads.json']);
   sh('git', ['add', '--', 'uploads.json.enc']);
   try { sh('git', ['diff', '--cached', '--quiet']); return; } catch { /* staged changes: commit them */ }
   sh('git', ['commit', '-q', '-m', msg]);
-  for (let i = 0; i < 3; i++) { try { sh('git', ['pull', '-q', '--rebase']); sh('git', ['push', '-q']); return; } catch (e) { if (i === 2) throw e; } }
+  for (let i = 0; i < 3; i++) { try { sh('git', ['pull', '-q', '--rebase', '--autostash']); sh('git', ['push', '-q']); return; } catch (e) { if (i === 2) throw e; } }
 }
 
 function stage(slugs, force) {
