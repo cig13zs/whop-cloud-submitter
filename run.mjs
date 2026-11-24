@@ -25,7 +25,7 @@ export const PUBLIC_SUBMIT_WINDOW = 28 * 60e3;
 // Full ids go to RECONCILE.json (encrypted with state), never plain in the public log.
 export const tag = vid => 'h' + createHash('sha256').update(String(vid).replace(/^\w+:/, '')).digest('hex').slice(0, 8);
 export const TT_WINDOW = 3 * 3600e3;
-export const GAP = 5 * 60e3;       // min time between two publishes on one channel ("just uplaod everything now", 2026-09-30)
+export const GAP = 6 * 3600e3;     // min time between two publishes on one channel; 2026-11-24: was 5 min, two overdue clips went out 10 min apart
 const DEFAULTS = { UC1xCBrygVPEwmmzLxSN_zNg: '86842687-ba2b-4638-a024-995dcf3d25a3' }; // Charisma Tape -> Sartain, feed backstop
 // channel-map.json {"channels": {"<UC id>": "<campaign id>"}, "videos": {"<video id>": "<campaign id>"}}.
 // One campaign per channel (2026-11-11). Clips can be posted outside queue.json; every public upload on a mapped
