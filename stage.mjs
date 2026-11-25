@@ -54,6 +54,21 @@ export const categoryForCampaign = (campaign) => {
   return '24';
 };
 
+// Reject classic UTF-8 mojibake (double-encoded emojis/dashes) before staging to YouTube.
+export const hasMojibake = (s) => /(?:\u00C3[\u0080-\u00BF]|\u00C2[\u0080-\u00BF]|\u00E2\u20AC|\uFFFD)/.test(String(s || ''));
+
+// Enforce >=8h separation between active scheduled/published slots on the same channel (Lorence 2026-11-25).
+export const MIN_PUBLISH_GAP_MS = 8 * 3600e3;
+export const findPublishGapConflict = (list, channel, publishAtIsoStr, minGapMs = MIN_PUBLISH_GAP_MS) => {
+  const t = Date.parse(publishAtIsoStr);
+  for (const r of list) {
+    if (r.channel !== channel || ['failed', 'missed', 'withdrawn', 'cancelled'].includes(r.state) || !r.publishAt) continue;
+    const dt = Math.abs(Date.parse(r.publishAt) - t);
+    if (dt < minGapMs) return { slug: r.slug, publishAt: r.publishAt, gapH: +(dt / 3600e3).toFixed(2) };
+  }
+  return null;
+};
+
 function pullAndOpen() { sh('git', ['pull', '-q', '--rebase', '--autostash']); node(['crypt.mjs', 'open']); }
 function sealAndPush(msg) {
   node(['crypt.mjs', 'seal', 'uploads.json']);
@@ -78,6 +93,10 @@ function stage(slugs, force) {
     if (!it) throw new Error(`${slug}: not in any ytq job file`);
     if (it.state !== 'queued') throw new Error(`${slug}: ytq state is ${it.state}, only queued clips can move to the cloud`);
     if (list.some(r => r.slug === slug && !['failed', 'missed'].includes(r.state))) throw new Error(`${slug}: already in uploads.json`);
+    if (hasMojibake(it.title) || hasMojibake(it.description)) throw new Error(`${slug}: UTF-8 mojibake detected in title/description; fix encoding before staging`);
+    const pubAt = jitterPublishAt(publishAtIso(it.date, it.time), slug);
+    const conflict = findPublishGapConflict(list, it.channel_id, pubAt);
+    if (conflict && !force) throw new Error(`${slug}: publishAt ${pubAt} is only ${conflict.gapH}h from ${conflict.slug} (${conflict.publishAt}) on ${it.channel_id} (<8h min separation)`);
     if (!list.some(r => r.channel === it.channel_id)) newChannels.add(it.channel_id);
     const tmp = mkdtempSync(path.join(os.tmpdir(), 'stage-'));
     try {
@@ -87,7 +106,7 @@ function stage(slugs, force) {
     } finally { rmSync(tmp, { recursive: true, force: true }); }
     list.push({ slug, channel: it.channel_id, title: it.title, description: it.description || '',
       categoryId: it.categoryId || categoryForCampaign(it.campaign), defaultLanguage: 'en', defaultAudioLanguage: 'en',
-      publishAt: jitterPublishAt(publishAtIso(it.date, it.time), slug),
+      publishAt: pubAt,
       campaign: it.campaign || null, state: 'staged', staged_at: new Date().toISOString() });
     writeFileSync(FILE, JSON.stringify(list, null, 1) + '\n');
     updateItem(it.jobFile, slug, x => { x.state = 'needs_human'; x.last_error = 'cloud: staged (cloud-submitter uploads.json)'; return 'staged to cloud uploader'; });
@@ -123,6 +142,9 @@ try {
     const j = Date.parse(jitterPublishAt('2099-11-15T14:00:00.000Z', 'test-slug-01')) - Date.parse('2099-11-15T14:00:00.000Z');
     if (Math.abs(j) < 7 * 60_000 || Math.abs(j) > 18 * 60_000) throw new Error(`jitter out of bounds: ${j}`);
     if (categoryForCampaign('802cf95a-0000') !== '20' || categoryForCampaign('91c5082d-0000') !== '17' || categoryForCampaign('463491d6-0000') !== '27' || categoryForCampaign('c3e0abdc-0000') !== '24') throw new Error('category map');
+    if (!hasMojibake('Wild clip \u00C3\u00B0\u00C5\u00B8') || hasMojibake('Wild clip \uD83D\uDE2D')) throw new Error('mojibake guard');
+    if (!findPublishGapConflict([{ slug: 'x1', channel: 'UC1', state: 'staged', publishAt: '2099-11-15T14:00:00.000Z' }], 'UC1', '2099-11-15T19:00:00.000Z')) throw new Error('8h gap guard failed to catch 5h conflict');
+    if (findPublishGapConflict([{ slug: 'x1', channel: 'UC1', state: 'staged', publishAt: '2099-11-15T14:00:00.000Z' }], 'UC1', '2099-11-15T22:30:00.000Z')) throw new Error('8h gap guard rejected 8.5h gap');
     console.log('stage selftest ok');
   }
   else if (cmd && !cmd.startsWith('-')) stage([cmd, ...rest].filter(s => !s.startsWith('-')), rest.includes('--force'));

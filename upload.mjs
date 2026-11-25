@@ -24,20 +24,26 @@ const RELEASE = 'yt-media';
 const UPLOAD = 'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status';
 const YT = 'https://www.googleapis.com/youtube/v3/';
 // Budget: videos.insert has its own default bucket of 100 calls a day, apart from the 10,000 units the reads
-// use (Google's quota guide, updated 2026-11-12). 20 a Pacific day matches our ~20 clips a day.
-const PER_DAY = Number(process.env.UPLOADS_PER_DAY || 20);
+// use (Google's quota guide, updated 2026-11-12). 40/day supports 10+/day across multiple Google accounts.
+const PER_DAY = Number(process.env.UPLOADS_PER_DAY || 40);
+const MAX_PER_RUN = Number(process.env.MAX_UPLOADS_PER_RUN || 3);
+const MAX_LEAD_MS = Number(process.env.MAX_UPLOAD_LEAD_H || 24) * 3600e3; // keep >24h rows staged in yt-media until <24h before publishAt
+const MIN_CHANNEL_UPLOAD_GAP_MS = Number(process.env.MIN_CHANNEL_UPLOAD_GAP_H || 4) * 3600e3;
 const MIN_LEAD_MS = 20 * 60e3; // YouTube rejects a publishAt in the past; don't race one that is minutes away
 const LOCK_AFTER_MS = 15 * 60e3;
+const sleepMs = ms => new Promise(r => setTimeout(r, ms));
 
 export const assetName = slug => `${slug}.mp4.enc`;
 const pacificDay = ms => new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
 
 // One pass over uploads.json rows: { slug, channel, title, description, publishAt, categoryId?, state, ... }
 // states: staged -> uploaded (video_id) -> live, or failed / locked / missed.
-export async function pass(rows, { now = Date.now(), io, dry = false }) {
+export async function pass(rows, { now = Date.now(), io, dry = false, sleep = sleepMs, maxPerRun = MAX_PER_RUN, maxLeadMs = MAX_LEAD_MS, minChGapMs = MIN_CHANNEL_UPLOAD_GAP_MS } = {}) {
   const log = [], fatal = [];
   const today = pacificDay(now);
   let used = rows.filter(r => r.uploaded_at && pacificDay(Date.parse(r.uploaded_at)) === today).length;
+  let runUploaded = 0;
+  const chUploadedThisRun = new Set();
 
   // 1) Readback: did YouTube make the uploaded ones public? Still private after publishAt = the audit lock.
   for (const r of rows.filter(r => r.state === 'uploaded' && Date.parse(r.publishAt) + LOCK_AFTER_MS < now)) {
@@ -46,13 +52,19 @@ export async function pass(rows, { now = Date.now(), io, dry = false }) {
     else { r.state = 'locked'; fatal.push(`${r.slug} ${r.video_id} still ${s?.privacyStatus || 'missing'} 15 min after publishAt: API audit lock? Set it public in Studio and turn UPLOAD_ON off`); }
   }
 
-  // 2) Upload staged rows, earliest slot first.
+  // 2) Upload staged rows, earliest slot first — anti-burst paced (<24h lead, max 1/channel/run, max 3/run, >=4h channel gap).
   for (const r of rows.filter(r => r.state === 'staged').sort((a, b) => Date.parse(a.publishAt) - Date.parse(b.publishAt))) {
     const at = Date.parse(r.publishAt);
     if (!(at > now + MIN_LEAD_MS)) { r.state = 'missed'; fatal.push(`${r.slug}: publishAt ${r.publishAt} passed before upload; restage it on a later slot`); continue; }
+    if (at - now > maxLeadMs) { log.push(`${r.slug}: waiting (${Math.round((at - now) / 3600e3)}h ahead > ${Math.round(maxLeadMs / 3600e3)}h lead window)`); continue; }
     if (used >= PER_DAY) { log.push(`${r.slug}: daily upload budget ${PER_DAY} used; next Pacific day`); continue; }
-    if (dry) { log.push(`DRY ${r.slug} -> ${r.channel} at ${r.publishAt}`); continue; }
+    if (runUploaded >= maxPerRun) { log.push(`${r.slug}: per-run anti-burst cap (${maxPerRun}) reached; next 30m tick`); continue; }
+    if (chUploadedThisRun.has(r.channel)) { log.push(`${r.slug}: 1/channel/run cap on ${r.channel}; next tick`); continue; }
+    const lastChUp = rows.filter(x => x.channel === r.channel && x.uploaded_at).reduce((m, x) => Math.max(m, Date.parse(x.uploaded_at) || 0), 0);
+    if (lastChUp && now - lastChUp < minChGapMs) { log.push(`${r.slug}: channel ${r.channel} uploaded ${Math.round((now - lastChUp) / 60e3)}m ago (<${Math.round(minChGapMs / 3600e3)}h gap); waiting`); continue; }
+    if (dry) { log.push(`DRY ${r.slug} -> ${r.channel} at ${r.publishAt}`); runUploaded++; chUploadedThisRun.add(r.channel); continue; }
     try {
+      if (runUploaded > 0 && sleep) await sleep(20_000 + Math.floor(Math.random() * 25_000));
       const bytes = openBytes(io.download(assetName(r.slug)));
       const video = await io.insert(r.channel, {
         snippet: {
@@ -69,6 +81,8 @@ export async function pass(rows, { now = Date.now(), io, dry = false }) {
       if (Date.parse(video.status?.publishAt) !== at) throw new Error(`publishAt read back ${video.status?.publishAt}, wanted ${r.publishAt}`);
       Object.assign(r, { state: 'uploaded', video_id: video.id, uploaded_at: new Date(now).toISOString(), error: null });
       used++;
+      runUploaded++;
+      chUploadedThisRun.add(r.channel);
       log.push(`${r.slug} uploaded ${video.id} on ${r.channel}, public at ${r.publishAt}`);
       try { io.deleteAsset(assetName(r.slug)); } catch (e) { log.push(`${r.slug}: asset delete failed (${e.message}); harmless`); }
     } catch (e) {
@@ -160,17 +174,21 @@ async function selftest() {
   const CAMP = 'de2b2ee3-bb22-453e-ae1a-c07bf89c5ef4';
   const iso = h => new Date(now + h * 3600e3).toISOString();
   const rows = [
-    { slug: 'b', channel: 'UC1', title: 'B', publishAt: iso(12), state: 'staged' },
+    { slug: 'b', channel: 'UC2', title: 'B', publishAt: iso(12), state: 'staged' },
     { slug: 'a', channel: 'UC1', title: 'A', publishAt: iso(6), state: 'staged', campaign: CAMP },
+    { slug: 'a2', channel: 'UC1', title: 'A2 same ch', publishAt: iso(18), state: 'staged' },
+    { slug: 'far', channel: 'UC3', title: 'Far 48h', publishAt: iso(48), state: 'staged' },
     { slug: 'pre', channel: 'UC1', state: 'uploaded', video_id: 'pre1', publishAt: iso(3), campaign: 'de2b2ee3' },
     { slug: 'late', channel: 'UC1', title: 'L', publishAt: iso(0.1), state: 'staged' },
     { slug: 'old', channel: 'UC1', state: 'uploaded', video_id: 'old1', publishAt: iso(-1) },
     { slug: 'stuck', channel: 'UC1', state: 'uploaded', video_id: 'stuck1', publishAt: iso(-1) },
     { slug: 'soon', channel: 'UC1', state: 'uploaded', video_id: 'soon1', publishAt: iso(-0.1) },
   ];
-  const { fatal } = await pass(rows, { now, io });
+  const { fatal } = await pass(rows, { now, io, sleep: null });
   const by = s => rows.find(r => r.slug === s);
-  assert(sent.length === 2 && sent[0].body.snippet.title === 'A', 'uploads earliest slot first');
+  assert(sent.length === 2 && sent[0].body.snippet.title === 'A' && sent[1].body.snippet.title === 'B', 'uploads earliest slot first across channels');
+  assert(by('a2').state === 'staged', 'enforces max 1 upload per channel per run');
+  assert(by('far').state === 'staged', 'holds >24h lead rows staged until inside lead window');
   assert(sent[0].bytes.equals(mp4), 'decrypts the asset before upload');
   assert(sent[0].body.status.privacyStatus === 'private' && sent[0].body.status.publishAt === iso(6), 'scheduled private with publishAt');
   assert(sent[0].body.status.containsSyntheticMedia === false && sent[0].body.status.selfDeclaredMadeForKids === false, 'altered + kids off');
@@ -183,27 +201,32 @@ async function selftest() {
   assert(by('soon').state === 'uploaded', 'inside the 15 min grace it is left alone');
   assert(regs.length === 1 && regs[0] === `vid1=${CAMP}` && by('a').registered, 'an upload with a campaign registers VIDEOID=CAMPAIGN');
   assert(!by('pre').registered && fatal.some(f => /pre: campaign "de2b2ee3" is not a full/.test(f)), 'a campaign prefix is refused loudly, never registered');
-  await pass(rows, { now, io });
+  await pass(rows, { now, io, sleep: null });
   assert(regs.length === 1, 'a registered row is not registered again');
+  assert(by('a2').state === 'staged', 'enforces 4h channel upload gap on immediate retry');
 
-  // daily budget, quota stop, retries
-  const many = Array.from({ length: PER_DAY + 2 }, (_, i) => ({ slug: 'c', channel: 'UC1', title: `C${i}`, publishAt: iso(5 + i), state: 'staged' }));
+  // per-run anti-burst cap & daily budget, quota stop, retries
+  const burst = Array.from({ length: 5 }, (_, i) => ({ slug: 'c', channel: `UCB${i}`, title: `B${i}`, publishAt: iso(5 + i), state: 'staged' }));
   sent.length = 0;
-  await pass(many, { now, io });
+  await pass(burst, { now, io, sleep: null });
+  assert(sent.length === 3, 'stops at 3 uploads per run by default');
+  const many = Array.from({ length: PER_DAY + 2 }, (_, i) => ({ slug: 'c', channel: `UCD${i}`, title: `C${i}`, publishAt: iso(5 + (i % 12)), state: 'staged' }));
+  sent.length = 0;
+  await pass(many, { now, io, sleep: null, maxPerRun: PER_DAY + 5 });
   assert(sent.length === PER_DAY, `stops at ${PER_DAY} uploads per Pacific day`);
-  const q = [{ slug: 'a', channel: 'UC1', title: 'Q1', publishAt: iso(5), state: 'staged' }, { slug: 'b', channel: 'UC1', title: 'Q2', publishAt: iso(6), state: 'staged' }];
+  const q = [{ slug: 'a', channel: 'UC1', title: 'Q1', publishAt: iso(5), state: 'staged' }, { slug: 'b', channel: 'UC2', title: 'Q2', publishAt: iso(6), state: 'staged' }];
   let calls = 0;
-  await pass(q, { now, io: { ...io, insert: async () => { calls++; throw new Error('403 quotaExceeded'); } } });
+  await pass(q, { now, io: { ...io, insert: async () => { calls++; throw new Error('403 quotaExceeded'); } }, sleep: null });
   assert(calls === 1 && q[0].state === 'staged', 'quotaExceeded stops the pass and keeps the row staged');
   const f = [{ slug: 'a', channel: 'UC1', title: 'F', publishAt: iso(5), state: 'staged', attempts: 2 }];
-  const r3 = await pass(f, { now, io: { ...io, insert: async () => { throw new Error('500 backendError'); } } });
+  const r3 = await pass(f, { now, io: { ...io, insert: async () => { throw new Error('500 backendError'); } }, sleep: null });
   assert(f[0].state === 'failed' && r3.fatal.length === 1, 'third failure -> failed + fatal');
   const bad = [{ slug: 'a', channel: 'UC1', title: 'P', publishAt: iso(5), state: 'staged' }];
-  await pass(bad, { now, io: { ...io, insert: async () => ({ id: 'x', status: { privacyStatus: 'private' } }) } });
+  await pass(bad, { now, io: { ...io, insert: async () => ({ id: 'x', status: { privacyStatus: 'private' } }) }, sleep: null });
   assert(bad[0].state === 'staged' && /publishAt read back/.test(bad[0].error), 'a lost publishAt is an error, not success');
   const dry = [{ slug: 'a', channel: 'UC1', title: 'D', publishAt: iso(5), state: 'staged' }];
   sent.length = 0;
-  await pass(dry, { now, io, dry: true });
+  await pass(dry, { now, io, dry: true, sleep: null });
   assert(sent.length === 0 && dry[0].state === 'staged', 'dry run uploads nothing');
   console.log('upload selftest ok');
 }
