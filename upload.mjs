@@ -55,7 +55,13 @@ export async function pass(rows, { now = Date.now(), io, dry = false }) {
     try {
       const bytes = openBytes(io.download(assetName(r.slug)));
       const video = await io.insert(r.channel, {
-        snippet: { title: r.title, description: r.description || '', categoryId: r.categoryId || '24' },
+        snippet: {
+          title: r.title,
+          description: r.description || '',
+          categoryId: r.categoryId || '24',
+          defaultLanguage: r.defaultLanguage || 'en',
+          defaultAudioLanguage: r.defaultAudioLanguage || 'en',
+        },
         status: { privacyStatus: 'private', publishAt: new Date(at).toISOString(), selfDeclaredMadeForKids: false, containsSyntheticMedia: false },
       }, bytes);
       if (!video?.id) throw new Error('no video id in the upload response');
@@ -168,6 +174,7 @@ async function selftest() {
   assert(sent[0].bytes.equals(mp4), 'decrypts the asset before upload');
   assert(sent[0].body.status.privacyStatus === 'private' && sent[0].body.status.publishAt === iso(6), 'scheduled private with publishAt');
   assert(sent[0].body.status.containsSyntheticMedia === false && sent[0].body.status.selfDeclaredMadeForKids === false, 'altered + kids off');
+  assert(sent[0].body.snippet.defaultLanguage === 'en' && sent[0].body.snippet.defaultAudioLanguage === 'en', 'defaults to English language/audio tags');
   assert(by('a').state === 'uploaded' && by('a').video_id === 'vid1', 'records the video id');
   assert(deleted.includes(assetName('a')), 'deletes the uploaded asset');
   assert(by('late').state === 'missed', 'a slot under 20 min away is missed, not raced');

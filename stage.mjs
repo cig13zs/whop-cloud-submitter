@@ -32,6 +32,28 @@ export const publishAtIso = (date, time) => {
   return new Date(ms).toISOString();
 };
 
+// Deterministic ±7..18 min human jitter keyed by slug so uploads never land on robotic :00:00 clock ticks.
+export const jitterPublishAt = (isoStr, slug) => {
+  let h = 2166136261;
+  for (const ch of String(slug || '')) { h ^= ch.charCodeAt(0); h = Math.imul(h, 16777619) >>> 0; }
+  const mag = 7 + (h % 12); // 7..18 min
+  const sign = (h & 1) ? 1 : -1;
+  const base = Date.parse(isoStr);
+  const shifted = base + sign * mag * 60_000;
+  // Never pull a slot within 25 min of now into the past; push forward instead if close.
+  const out = shifted < Date.now() + 25 * 60_000 ? base + mag * 60_000 : shifted;
+  return new Date(out).toISOString();
+};
+
+// Map campaign UUID prefix / niche to YouTube categoryId (20 Gaming, 17 Sports, 27 Education, 24 Entertainment).
+export const categoryForCampaign = (campaign) => {
+  const p = String(campaign || '').slice(0, 8).toLowerCase();
+  if (['802cf95a', '402a2657', '3b30ef83', '40562c73', 'f79c592a', '0d341d7d', '098c2c7a', '6b341aff', 'a5c63fad', 'dc7183a8', '1d2bcb00'].includes(p)) return '20';
+  if (['91c5082d'].includes(p)) return '17';
+  if (['463491d6'].includes(p)) return '27';
+  return '24';
+};
+
 function pullAndOpen() { sh('git', ['pull', '-q', '--rebase', '--autostash']); node(['crypt.mjs', 'open']); }
 function sealAndPush(msg) {
   node(['crypt.mjs', 'seal', 'uploads.json']);
@@ -63,7 +85,9 @@ function stage(slugs, force) {
       writeFileSync(enc, sealBytes(readFileSync(it.file)));
       sh('gh', ['release', 'upload', 'yt-media', enc, '--clobber', '-R', REPO]);
     } finally { rmSync(tmp, { recursive: true, force: true }); }
-    list.push({ slug, channel: it.channel_id, title: it.title, description: it.description || '', publishAt: publishAtIso(it.date, it.time),
+    list.push({ slug, channel: it.channel_id, title: it.title, description: it.description || '',
+      categoryId: it.categoryId || categoryForCampaign(it.campaign), defaultLanguage: 'en', defaultAudioLanguage: 'en',
+      publishAt: jitterPublishAt(publishAtIso(it.date, it.time), slug),
       campaign: it.campaign || null, state: 'staged', staged_at: new Date().toISOString() });
     writeFileSync(FILE, JSON.stringify(list, null, 1) + '\n');
     updateItem(it.jobFile, slug, x => { x.state = 'needs_human'; x.last_error = 'cloud: staged (cloud-submitter uploads.json)'; return 'staged to cloud uploader'; });
@@ -96,6 +120,9 @@ try {
   else if (cmd === 'selftest') {
     if (publishAtIso('Nov 15, 2026', '10:00 PM') !== '2026-11-15T14:00:00.000Z') throw new Error('Manila slot -> UTC');
     if (publishAtIso('Nov 16, 2026', '4:00 AM') !== '2026-11-15T20:00:00.000Z') throw new Error('early slot crosses the day back');
+    const j = Date.parse(jitterPublishAt('2099-11-15T14:00:00.000Z', 'test-slug-01')) - Date.parse('2099-11-15T14:00:00.000Z');
+    if (Math.abs(j) < 7 * 60_000 || Math.abs(j) > 18 * 60_000) throw new Error(`jitter out of bounds: ${j}`);
+    if (categoryForCampaign('802cf95a-0000') !== '20' || categoryForCampaign('91c5082d-0000') !== '17' || categoryForCampaign('463491d6-0000') !== '27' || categoryForCampaign('c3e0abdc-0000') !== '24') throw new Error('category map');
     console.log('stage selftest ok');
   }
   else if (cmd && !cmd.startsWith('-')) stage([cmd, ...rest].filter(s => !s.startsWith('-')), rest.includes('--force'));
