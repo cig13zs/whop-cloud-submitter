@@ -22,6 +22,7 @@ const DIR = path.dirname(fileURLToPath(import.meta.url));
 const FILE = path.join(DIR, 'uploads.json');
 const RELEASE = 'yt-media';
 const UPLOAD = 'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status';
+const THUMB = 'https://www.googleapis.com/upload/youtube/v3/thumbnails/set?uploadType=media&videoId=';
 const YT = 'https://www.googleapis.com/youtube/v3/';
 // Budget: videos.insert has its own default bucket of 100 calls a day, apart from the 10,000 units the reads
 // use (Google's quota guide, updated 2026-11-12). 40/day supports 10+/day across multiple Google accounts.
@@ -34,6 +35,7 @@ const LOCK_AFTER_MS = 15 * 60e3;
 const sleepMs = ms => new Promise(r => setTimeout(r, ms));
 
 export const assetName = slug => `${slug}.mp4.enc`;
+export const thumbAssetName = slug => `${slug}.thumb.enc`;
 const pacificDay = ms => new Date(ms).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
 
 // One pass over uploads.json rows: { slug, channel, title, description, publishAt, categoryId?, state, ... }
@@ -84,6 +86,18 @@ export async function pass(rows, { now = Date.now(), io, dry = false, sleep = sl
       runUploaded++;
       chUploadedThisRun.add(r.channel);
       log.push(`${r.slug} uploaded ${video.id} on ${r.channel}, public at ${r.publishAt}`);
+      if (r.thumbnail && io.setThumbnail) {
+        try {
+          const tBytes = openBytes(io.download(thumbAssetName(r.slug)));
+          await io.setThumbnail(r.channel, video.id, tBytes, r.thumbnail);
+          r.thumbnail_applied = true;
+          log.push(`${r.slug}: custom thumbnail applied`);
+          try { io.deleteAsset(thumbAssetName(r.slug)); } catch { /* harmless */ }
+        } catch (e) {
+          r.thumbnail_error = e.message;
+          log.push(`${r.slug}: custom thumbnail skipped (${e.message})`);
+        }
+      }
       try { io.deleteAsset(assetName(r.slug)); } catch (e) { log.push(`${r.slug}: asset delete failed (${e.message}); harmless`); }
     } catch (e) {
       r.attempts = (r.attempts || 0) + 1;
@@ -115,7 +129,7 @@ async function apiError(r) {
   const d = await r.json().catch(() => ({}));
   return new Error(`${r.status} ${d.error?.errors?.[0]?.reason || ''} ${d.error?.message || ''}`.trim());
 }
-const gh = args => execFileSync('gh', ['release', ...args, '-R', 'cig13zs/whop-cloud-submitter'], { stdio: 'pipe', timeout: 120_000 });
+const gh = args => execFileSync('gh', ['release', ...args, '-R', 'cig13zs/whop-cloud-submitter'], { stdio: 'pipe', timeout: 300_000 });
 export const realIO = {
   download(asset) {
     const tmp = mkdtempSync(path.join(os.tmpdir(), 'ytm-'));
@@ -136,6 +150,13 @@ export const realIO = {
     const put = await ytFetch(channel, init.headers.get('location'), { method: 'PUT', body: bytes, headers: { 'content-type': 'video/mp4' } });
     if (!put.ok) throw await apiError(put);
     return put.json();
+  },
+  async setThumbnail(channel, videoId, bytes, mime = 'image/png') {
+    const r = await ytFetch(channel, `${THUMB}${encodeURIComponent(videoId)}`, {
+      method: 'POST', body: bytes, headers: { 'content-type': mime },
+    });
+    if (!r.ok) throw await apiError(r);
+    return r.json();
   },
   async status(channel, id) {
     const r = await ytFetch(channel, `${YT}videos?part=status&id=${encodeURIComponent(id)}`);
@@ -228,6 +249,17 @@ async function selftest() {
   sent.length = 0;
   await pass(dry, { now, io, dry: true, sleep: null });
   assert(sent.length === 0 && dry[0].state === 'staged', 'dry run uploads nothing');
+  // custom thumbnail upload + non-fatal fallback
+  const thumbBytes = Buffer.from('fake png bytes');
+  assets[thumbAssetName('a')] = sealBytes(thumbBytes);
+  const thumbs = [];
+  const tRow = [{ slug: 'a', channel: 'UC1', title: 'T', publishAt: iso(5), state: 'staged', thumbnail: 'image/png' }];
+  await pass(tRow, { now, io: { ...io, setThumbnail: async (ch, id, b, m) => thumbs.push({ ch, id, b, m }) }, sleep: null });
+  assert(tRow[0].state === 'uploaded' && tRow[0].thumbnail_applied === true && thumbs.length === 1 && thumbs[0].b.equals(thumbBytes) && deleted.includes(thumbAssetName('a')), 'applies custom thumbnail and deletes thumb asset');
+  assets[thumbAssetName('b')] = sealBytes(thumbBytes);
+  const tFail = [{ slug: 'b', channel: 'UC2', title: 'T2', publishAt: iso(5), state: 'staged', thumbnail: 'image/png' }];
+  await pass(tFail, { now, io: { ...io, setThumbnail: async () => { throw new Error('403 forbidden phone verify'); } }, sleep: null });
+  assert(tFail[0].state === 'uploaded' && /403 forbidden/.test(tFail[0].thumbnail_error), 'thumbnail 403 is non-fatal so video still schedules');
   console.log('upload selftest ok');
 }
 

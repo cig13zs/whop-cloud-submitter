@@ -15,7 +15,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { sealBytes } from './crypt.mjs';
-import { assetName } from './upload.mjs';
+import { assetName, thumbAssetName } from './upload.mjs';
 import { loadJobs, allItems, updateItem } from '../../../tools/ytq/lib.mjs';
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -99,14 +99,23 @@ function stage(slugs, force) {
     if (conflict && !force) throw new Error(`${slug}: publishAt ${pubAt} is only ${conflict.gapH}h from ${conflict.slug} (${conflict.publishAt}) on ${it.channel_id} (<8h min separation)`);
     if (!list.some(r => r.channel === it.channel_id)) newChannels.add(it.channel_id);
     const tmp = mkdtempSync(path.join(os.tmpdir(), 'stage-'));
+    let thumbMime = null;
     try {
       const enc = path.join(tmp, assetName(slug));
       writeFileSync(enc, sealBytes(readFileSync(it.file)));
       sh('gh', ['release', 'upload', 'yt-media', enc, '--clobber', '-R', REPO]);
+      if (it.thumbnail && existsSync(it.thumbnail)) {
+        const ext = path.extname(it.thumbnail).toLowerCase();
+        thumbMime = (ext === '.jpg' || ext === '.jpeg') ? 'image/jpeg' : 'image/png';
+        const tEnc = path.join(tmp, thumbAssetName(slug));
+        writeFileSync(tEnc, sealBytes(readFileSync(it.thumbnail)));
+        sh('gh', ['release', 'upload', 'yt-media', tEnc, '--clobber', '-R', REPO]);
+      }
     } finally { rmSync(tmp, { recursive: true, force: true }); }
     list.push({ slug, channel: it.channel_id, title: it.title, description: it.description || '',
       categoryId: it.categoryId || categoryForCampaign(it.campaign), defaultLanguage: 'en', defaultAudioLanguage: 'en',
       publishAt: pubAt,
+      ...(thumbMime ? { thumbnail: thumbMime } : {}),
       campaign: it.campaign || null, state: 'staged', staged_at: new Date().toISOString() });
     writeFileSync(FILE, JSON.stringify(list, null, 1) + '\n');
     updateItem(it.jobFile, slug, x => { x.state = 'needs_human'; x.last_error = 'cloud: staged (cloud-submitter uploads.json)'; return 'staged to cloud uploader'; });
