@@ -42,8 +42,8 @@ a1259128aad6 watching
 1c58dd99b1c2 watching
 495b8811c7b0 watching
 8956f50e3ace submitted
-6151fa765251 watching
-ae064079a38b watching
+6151fa765251 submitted
+ae064079a38b submitted
 b85e2e64bcd7 submitted
 2feafe3e4b83 submitted
 7834e345c645 submitted
@@ -81,5 +81,5 @@ b1ca27322368 submitted
 554698885fc3 watching
 a95af092cd99 submitted
 16af65d7141f submitted
-1b77324a4caa queued
+1b77324a4caa submitted
 5da579357536 submitted
