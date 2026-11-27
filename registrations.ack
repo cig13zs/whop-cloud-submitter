@@ -71,7 +71,7 @@ d19a3c2eff69 submitted
 d5106721afe0 MISSED: public past 28 min without a submit
 f95fdb3e1ff7 submitted
 825fc802ae1b submitted
-8403922bd2d7 public, submitting
+8403922bd2d7 MISSED: public past 28 min without a submit
 1d600c68fc76 submitted
 01d32cc71515 watching
 724f8e629e30 watching
