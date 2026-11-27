@@ -47,10 +47,10 @@ ae064079a38b watching
 b85e2e64bcd7 submitted
 2feafe3e4b83 submitted
 7834e345c645 submitted
-94ffeb4f87a0 watching
+94ffeb4f87a0 submitted
 fa99b9a225ab submitted
 f99430951ed3 submitted
-f7e6f449cde2 watching
+f7e6f449cde2 submitted
 1a9cecd1f71e submitted
 028e7d692461 submitted
 4da48727105d submitted
@@ -58,7 +58,7 @@ f7e6f449cde2 watching
 1d2c8f32f152 submitted
 d921dd2939ed submitted
 d23e30d89e94 watching
-4987fe99ef9d watching
+4987fe99ef9d submitted
 48e1f9e3b0a8 submitted
 bb2d907300ed submitted
 da46082b9fa3 submitted
