@@ -96,6 +96,5 @@ b3aa1f6dbcc7 watching
 459be4cee652 watching
 8f882d94f922 submitted
 9266a62d5678 watching
-7320caa5cb91 REJECTED unreadable: encrypt VIDEOID=CAMPAIGN-UUID to register.pub, one per line
 1b77324a4caa submitted
 5da579357536 submitted
