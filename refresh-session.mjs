@@ -17,7 +17,35 @@ const DIR = path.dirname(fileURLToPath(import.meta.url));
 const slash = p => p.replace(/\\/g, '/');
 const AC = slash(process.env.WHOP_AC_DIR || path.join(homedir(), 'Desktop', 'CLAUDE CODE OUTPUTS', 'tools', 'agent-chrome'));
 const KEYS = slash(process.env.WHOP_KEYS_DIR || path.join(homedir(), '.claude', 'keys'));
+const YTQ_CONFIG = path.resolve(DIR, '..', '..', '..', 'tools', 'ytq', 'config.json');
 const APP = process.env.WHOP_APP_URL || 'https://b4e0vdqv6zgqeqj4pfgm.apps.whop.com/c/exp_zeADOv9rOOKk2x/campaigns';
+
+// P0 Anti-Ban Firewall (2026-11-28): never export refresh tokens for terminated/quarantined channels or accounts.
+const TERMINATED_ACCOUNTS = new Set(['lrnsdc', 'whopclippingxx1', 'whopclipping3xx']);
+const TERMINATED_CHANNELS = new Set([
+  'UCSNtJALmEpivjopI-KD3zgA', 'UCMA3hbf03deFQciSPqhS47w', 'UCMfeRlsfComsw9t7lqidaIg',
+  'UCYyu_RrDxU4uf3Dt89p51-A', 'UCK-8kboJ5Cgc7t8HK_2ra-A', 'UCgyvh-CTVC3O5TQ7r1IldPw',
+  'UCKKpxv3IzEtGinueX3QRVOw', 'UCPwiaBsnEP-HRN0cjjYyZ0Q', 'UCD_2imVu4qfifvQ33i7K75A',
+  'UCGIPbWozVMPNzHkfIiC0ZZw', 'UCSrjOnGWmTjFchhEIfHCC1w', 'UCygfYzxU0GFOvMQ82rO9Vhg',
+  'UCmxGazu1_EuIqfRuuN31FTw', 'UCgojoQRXenWhNvgUOJgl1ig', 'UCfbSGGOu710aN1jR4FCALMA',
+  'UCDqMk5Ea58hGt7Kd97OrzFw', 'UCCwVMi_ld5BtxwICqVs8wVA', 'UC2LBGopKzm8s3lLj1CQdS5w',
+  'UC0PrT71Wsjdx3KKgjMXl9vw', 'UCy1nKwYzPZmPZKlMCJD29oQ', 'UC6gRxcVY1LOHWaqutG27vDQ',
+  'UCpIRQIt0m1GlArCesaLCypg', 'UC_1AYskXlX0E3sOO0Z23J2Q',
+]);
+
+function loadTerminatedCheck() {
+  let cfg = {};
+  try { cfg = JSON.parse(readFileSync(YTQ_CONFIG, 'utf8').replace(/^\uFEFF/, '')); } catch {}
+  const accts = new Set([...TERMINATED_ACCOUNTS, ...(cfg.terminated_accounts || [])]);
+  const chs = new Set([...TERMINATED_CHANNELS, ...Object.keys(cfg.terminated_channels || {})]);
+  return ch => {
+    if (!ch || chs.has(ch)) return true;
+    const info = cfg.channels?.[ch];
+    if (info?.terminated === true || (info?.account && accts.has(info.account))) return true;
+    const rest = cfg.resting_channels?.[ch];
+    return typeof rest === 'string' && rest.startsWith('2099-');
+  };
+}
 
 // --local: run run.mjs on this laptop with the same values in its env instead of pushing them to Actions secrets.
 // whop_watch.py does this while the laptop is on, so it costs no Actions minutes (dispatching ~100 cloud runs a day
@@ -65,8 +93,13 @@ function youtube() {
   // queue channels (submitter) + uploads.json channels (cloud uploader, upload.mjs)
   const uploads = existsSync(path.join(DIR, 'uploads.json')) ? JSON.parse(readFileSync(path.join(DIR, 'uploads.json'), 'utf8')) : [];
   const channels = [...new Set([...Object.values(JSON.parse(readFileSync(path.join(DIR, 'queue.json'), 'utf8'))), ...uploads].map(q => q.channel).filter(Boolean))];
+  const isTerminated = loadTerminatedCheck();
   const tokens = {};
   for (const ch of channels) {
+    if (isTerminated(ch)) {
+      console.log(`${ch}: skipped (terminated/quarantined by Anti-Ban Firewall)`);
+      continue;
+    }
     // 11-23: one old queue channel never consented (no token file) blocked every channel's refresh. A queue channel
     // without a token only loses the private-status read; an uploads.json channel can't upload without one, so it fails.
     if (!existsSync(`${KEYS}/yt-tokens/${ch}.json`)) {
